@@ -1,0 +1,319 @@
+diff --git a/server/controllers/api_controller.go b/server/controllers/api_controller.go
+index cca3efb..bde70a0 100644
+--- a/server/controllers/api_controller.go
++++ b/server/controllers/api_controller.go
+@@ -1029,7 +1029,7 @@ func upsertProjectPolicyStatus(pullStatus *models.PullStatus, result command.Pro
+ 		if status.Workspace == project.Workspace &&
+ 			status.RepoRelDir == project.RepoRelDir &&
+ 			status.ProjectName == project.ProjectName {
+-			project.Status = planStatusAfterPolicyCheck(project.Status, result)
++			project.Status = result.PlanStatusAfterMerge(project.Status)
+ 			project.PolicyStatus = mergePolicyStatuses(project.PolicyStatus, status.PolicyStatus)
+ 			return
+ 		}
+@@ -1038,17 +1038,6 @@ func upsertProjectPolicyStatus(pullStatus *models.PullStatus, result command.Pro
+ 	pullStatus.Projects = append(pullStatus.Projects, status)
+ }
+ 
+-func planStatusAfterPolicyCheck(existing models.ProjectPlanStatus, result command.ProjectResult) models.ProjectPlanStatus {
+-	policyStatus := result.PlanStatus()
+-	if policyStatus == models.ErroredPolicyCheckStatus {
+-		return policyStatus
+-	}
+-	if existing == models.PlannedPlanStatus || existing == models.ErroredPolicyCheckStatus {
+-		return policyStatus
+-	}
+-	return existing
+-}
+-
+ func upsertProjectStatus(pullStatus *models.PullStatus, status models.ProjectStatus) {
+ 	for idx := range pullStatus.Projects {
+ 		project := &pullStatus.Projects[idx]
+diff --git a/server/core/boltdb/boltdb.go b/server/core/boltdb/boltdb.go
+index 2522c2f..a154b60 100644
+--- a/server/core/boltdb/boltdb.go
++++ b/server/core/boltdb/boltdb.go
+@@ -468,7 +468,7 @@ func (b *BoltDB) UpdatePullWithResults(pull models.PullRequest, newResults []com
+ 						res.RepoRelDir == proj.RepoRelDir &&
+ 						res.ProjectName == proj.ProjectName {
+ 
+-						proj.Status = res.PlanStatus()
++						proj.Status = res.PlanStatusAfterMerge(proj.Status)
+ 						proj.PlanHash = res.PlanHashAfterMerge(proj.PlanHash)
+ 
+ 						// Updating only policy sets which are included in results; keeping the rest.
+diff --git a/server/core/boltdb/policy_status_test.go b/server/core/boltdb/policy_status_test.go
+new file mode 100644
+index 0000000..0c4f8c8
+--- /dev/null
++++ b/server/core/boltdb/policy_status_test.go
+@@ -0,0 +1,75 @@
++package boltdb_test
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	"github.com/runatlantis/atlantis/server/events/command"
++	"github.com/runatlantis/atlantis/server/events/models"
++)
++
++func TestPolicyChecksPreserveCompletedProjects(t *testing.T) {
++	b := newTestDB2(t)
++	defer b.Close()
++	pull := models.PullRequest{Num: 1, HeadCommit: "sha", BaseRepo: models.Repo{FullName: "owner/repo", VCSHost: models.VCSHost{Type: models.Github}}}
++	result := func(cmd command.Name, i int) command.ProjectResult {
++		return command.ProjectResult{Command: cmd, Workspace: "default", RepoRelDir: fmt.Sprintf("project-%d", i), ProjectName: fmt.Sprintf("project-%d", i)}
++	}
++	plans := make([]command.ProjectResult, 8)
++	policies := make([]command.ProjectResult, 8)
++	for i := range plans {
++		plans[i] = result(command.Plan, i)
++		output := "No changes. Your infrastructure matches the configuration."
++		if i == 7 {
++			output = "Plan: 1 to add, 0 to change, 0 to destroy."
++		}
++		plans[i].PlanSuccess = &models.PlanSuccess{TerraformOutput: output}
++		policies[i] = result(command.PolicyCheck, i)
++	}
++	if _, err := b.UpdatePullWithResults(pull, plans); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := b.UpdatePullWithResults(pull, policies); err != nil {
++		t.Fatal(err)
++	}
++	applied := result(command.Apply, 7)
++	applied.ApplySuccess = "applied"
++	if _, err := b.UpdatePullWithResults(pull, []command.ProjectResult{applied}); err != nil {
++		t.Fatal(err)
++	}
++	assertCompleted := func(want int) {
++		t.Helper()
++		stored, err := b.GetPullStatus(pull)
++		if err != nil {
++			t.Fatal(err)
++		}
++		completed := 0
++		for _, project := range stored.Projects {
++			if project.Status == models.PlannedNoChangesPlanStatus || project.Status == models.AppliedPlanStatus {
++				completed++
++			}
++		}
++		if completed != want {
++			t.Fatalf("completed projects = %d, want %d; stored projects: %+v", completed, want, stored.Projects)
++		}
++	}
++	assertCompleted(8)
++	if _, err := b.UpdatePullWithResults(pull, []command.ProjectResult{policies[7]}); err != nil {
++		t.Fatal(err)
++	}
++	assertCompleted(8)
++	failed := policies[0]
++	failed.Error = errors.New("policy failed")
++	if _, err := b.UpdatePullWithResults(pull, []command.ProjectResult{failed}); err != nil {
++		t.Fatal(err)
++	}
++	stored, err := b.GetPullStatus(pull)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if stored.Projects[0].Status != models.ErroredPolicyCheckStatus {
++		t.Fatalf("failed policy status = %s", stored.Projects[0].Status)
++	}
++	assertCompleted(7)
++}
+diff --git a/server/core/redis/redis.go b/server/core/redis/redis.go
+index b979b27..a290d51 100644
+--- a/server/core/redis/redis.go
++++ b/server/core/redis/redis.go
+@@ -522,7 +522,7 @@ func (r *RedisDB) UpdatePullWithResults(pull models.PullRequest, newResults []co
+ 					res.RepoRelDir == proj.RepoRelDir &&
+ 					res.ProjectName == proj.ProjectName {
+ 
+-					proj.Status = res.PlanStatus()
++					proj.Status = res.PlanStatusAfterMerge(proj.Status)
+ 					proj.PlanHash = res.PlanHashAfterMerge(proj.PlanHash)
+ 
+ 					// Updating only policy sets which are included in results; keeping the rest.
+diff --git a/server/events/command/project_result.go b/server/events/command/project_result.go
+index 6489695..5547696 100644
+--- a/server/events/command/project_result.go
++++ b/server/events/command/project_result.go
+@@ -97,6 +97,26 @@ func (p ProjectResult) PlanStatus() models.ProjectPlanStatus {
+ 	panic("PlanStatus() missing a combination")
+ }
+ 
++// PlanStatusAfterMerge preserves a completed plan when policy checks succeed.
++func (p ProjectResult) PlanStatusAfterMerge(existing models.ProjectPlanStatus) models.ProjectPlanStatus {
++	status := p.PlanStatus()
++	if p.Command != PolicyCheck && p.Command != ApprovePolicies {
++		return status
++	}
++	if status == models.ErroredPolicyCheckStatus || existing == models.PlannedPlanStatus || existing == models.ErroredPolicyCheckStatus {
++		return status
++	}
++	return existing
++}
++
++// HasWarnings returns true if any policy set output contains a Conftest warning.
++func (p ProjectResult) HasWarnings() bool {
++	if p.PolicyCheckResults == nil {
++		return false
++	}
++	return p.PolicyCheckResults.HasWarnings()
++}
++
+ // PlanHashAfterMerge returns the plan hash a project's stored status should
+ // carry once this result is merged into it. A plan result replaces the
+ // previous hash with the hash of the plan file it produced, which is empty
+diff --git a/server/events/command/result.go b/server/events/command/result.go
+index 2accc9e..6f246e1 100644
+--- a/server/events/command/result.go
++++ b/server/events/command/result.go
+@@ -27,3 +27,13 @@ func (c Result) HasErrors() bool {
+ 	}
+ 	return false
+ }
++
++// HasWarnings returns true if any project result recorded a policy warning.
++func (c Result) HasWarnings() bool {
++	for _, r := range c.ProjectResults {
++		if r.HasWarnings() {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/server/events/markdown_renderer.go b/server/events/markdown_renderer.go
+index cfe2b9f..6c29a15 100644
+--- a/server/events/markdown_renderer.go
++++ b/server/events/markdown_renderer.go
+@@ -297,6 +297,9 @@ func (m *MarkdownRenderer) renderProjectResults(ctx *command.Context, results []
+ 				resultData.Rendered = m.renderTemplateTrimSpace(templates.Lookup("policyCheckResultsUnwrapped"), policyCheckResults)
+ 			}
+ 			if result.Error == nil && result.Failure == "" {
++				if result.PolicyCheckResults.HasWarnings() {
++					resultData.IsSuccessful = false
++				}
+ 				numPolicyCheckSuccesses++
+ 			}
+ 		} else if result.PolicyCheckResults != nil && common.CommandName == approvePoliciesCommandTitle {
+diff --git a/server/events/models/models.go b/server/events/models/models.go
+index 78d5f14..b2be546 100644
+--- a/server/events/models/models.go
++++ b/server/events/models/models.go
+@@ -756,6 +756,17 @@ func (p *PolicyCheckResults) Summary() string {
+ 	return strings.Trim(note, "\n")
+ }
+ 
++// HasWarnings returns true if any policy set output contains a Conftest warning.
++func (p *PolicyCheckResults) HasWarnings() bool {
++	r := regexp.MustCompile(`(?m)^WARN - |, [1-9][0-9]* warnings?,`)
++	for _, policySetResult := range p.PolicySetResults {
++		if r.MatchString(policySetResult.PolicyOutput) {
++			return true
++		}
++	}
++	return false
++}
++
+ // PolicyCleared is used to determine if policies have all succeeded or been approved.
+ func (p *PolicyCheckResults) PolicyCleared() bool {
+ 	passing := true
+diff --git a/server/events/policy_check_command_runner.go b/server/events/policy_check_command_runner.go
+index 1c4c6ab..c497618 100644
+--- a/server/events/policy_check_command_runner.go
++++ b/server/events/policy_check_command_runner.go
+@@ -69,7 +69,7 @@ func (p *PolicyCheckCommandRunner) Run(ctx *command.Context, cmds []command.Proj
+ 	}
+ 
+ 	// Quiet policy checks unless there's an error
+-	if result.HasErrors() || !p.quietPolicyChecks {
++	if result.HasErrors() || result.HasWarnings() || !p.quietPolicyChecks {
+ 		p.pullUpdater.updatePull(ctx, PolicyCheckCommand{}, result)
+ 	}
+ 
+@@ -86,7 +86,9 @@ func (p *PolicyCheckCommandRunner) updateCommitStatus(ctx *command.Context, pull
+ 	var numErrored int
+ 	status := models.SuccessCommitStatus
+ 
+-	numSuccess = pullStatus.StatusCount(models.PassedPolicyCheckStatus)
++	numSuccess = pullStatus.StatusCount(models.PassedPolicyCheckStatus) +
++		pullStatus.StatusCount(models.PlannedNoChangesPlanStatus) +
++		pullStatus.StatusCount(models.AppliedPlanStatus)
+ 	numErrored = pullStatus.StatusCount(models.ErroredPolicyCheckStatus)
+ 
+ 	if numErrored > 0 {
+diff --git a/server/events/vcs/github/client.go b/server/events/vcs/github/client.go
+index 0d0a95c..e888965 100644
+--- a/server/events/vcs/github/client.go
++++ b/server/events/vcs/github/client.go
+@@ -228,7 +228,11 @@ func (g *Client) CreateComment(logger logging.SimpleLogging, repo models.Repo, p
+ 	logger.Debug("Creating comment on GitHub pull request %d", pullNum)
+ 
+ 	comments := common.SplitComment(logger, comment, maxCommentLength, g.maxCommentsPerCommand, command)
++	marker := g.commentMarker()
+ 	for i := range comments {
++		if marker != "" {
++			comments[i] += "\n" + marker
++		}
+ 		_, resp, err := g.client.Issues.CreateComment(g.ctx, repo.Owner, repo.Name, pullNum, &github.IssueComment{Body: &comments[i]})
+ 		if resp != nil {
+ 			logger.Debug("POST /repos/%v/%v/issues/%d/comments returned: %v", repo.Owner, repo.Name, pullNum, resp.StatusCode)
+@@ -240,6 +244,13 @@ func (g *Client) CreateComment(logger logging.SimpleLogging, repo models.Repo, p
+ 	return nil
+ }
+ 
++func (g *Client) commentMarker() string {
++	if g.config.ExecutableName == "" {
++		return ""
++	}
++	return fmt.Sprintf("<!-- atlantis-executable: %s -->", g.config.ExecutableName)
++}
++
+ // ReactToComment adds a reaction to a comment.
+ func (g *Client) ReactToComment(logger logging.SimpleLogging, repo models.Repo, _ int, commentID int64, reaction string) error {
+ 	logger.Debug("Adding reaction to GitHub pull request comment %d", commentID)
+@@ -289,7 +300,12 @@ func (g *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo mode
+ 			continue
+ 		}
+ 		firstLine := strings.ToLower(body[0])
+-		if !strings.Contains(firstLine, strings.ToLower(command)) {
++		cmdLower := strings.ToLower(command)
++		cmdUnderscore := strings.ReplaceAll(cmdLower, " ", "_")
++		if !strings.Contains(firstLine, cmdLower) && !strings.Contains(firstLine, cmdUnderscore) {
++			continue
++		}
++		if marker := g.commentMarker(); marker != "" && strings.Contains(comment.GetBody(), "<!-- atlantis-executable: ") && !strings.Contains(comment.GetBody(), marker) {
+ 			continue
+ 		}
+ 
+diff --git a/server/events/vcs/github/config.go b/server/events/vcs/github/config.go
+index 52a6b15..80b1467 100644
+--- a/server/events/vcs/github/config.go
++++ b/server/events/vcs/github/config.go
+@@ -6,4 +6,5 @@ package github
+ // GithubConfig allows for custom github-specific functionality and behavior
+ type Config struct {
+ 	AllowMergeableBypassApply bool
++	ExecutableName            string
+ }
+diff --git a/server/server.go b/server/server.go
+index e74bfc7..dd66f00 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -229,10 +229,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
+ 	}
+ 
+ 	if userConfig.GithubUser != "" || userConfig.GithubAppID != 0 {
+-		if userConfig.GithubAllowMergeableBypassApply {
+-			githubConfig = github.Config{
+-				AllowMergeableBypassApply: true,
+-			}
++		githubConfig = github.Config{
++			AllowMergeableBypassApply: userConfig.GithubAllowMergeableBypassApply,
++			ExecutableName:            userConfig.ExecutableName,
+ 		}
+ 		supportedVCSHosts = append(supportedVCSHosts, models.Github)
+ 		if userConfig.GithubUser != "" {

@@ -1,0 +1,39 @@
+# Move each input on its own and keep it only if every package still builds
+# and passes its tests, so one broken upstream cannot hold back the others.
+name: Update inputs
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - name: Update, build and publish
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          failed=""
+          for input in $(jq -r '.nodes.root.inputs | keys[]' flake.lock); do
+            nix flake update "$input"
+            git diff --quiet flake.lock && continue
+            if nix flake check --print-build-logs; then
+              git commit -qam "Update $input"
+            else
+              git checkout flake.lock
+              failed="$failed $input"
+            fi
+          done
+          git push origin HEAD:main
+          if [ -n "$failed" ]; then echo "::error::held back:$failed"; exit 1; fi
