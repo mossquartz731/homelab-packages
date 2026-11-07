@@ -1,0 +1,136 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -5,7 +5,6 @@
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
+-	"strings"
+ 
+ 	"github.com/nlewo/comin/internal/types"
+ 	"github.com/sirupsen/logrus"
+@@ -24,13 +23,6 @@
+ 		return config, err
+ 	}
+ 	for i, remote := range config.Remotes {
+-		if remote.Auth.AccessTokenPath != "" {
+-			content, err := os.ReadFile(remote.Auth.AccessTokenPath)
+-			if err != nil {
+-				return config, err
+-			}
+-			config.Remotes[i].Auth.AccessToken = strings.TrimSpace(string(content))
+-		}
+ 		// On GitLab and GitHub, any non blank username is working
+ 		if remote.Auth.Username == "" {
+ 			config.Remotes[i].Auth.Username = "comin"
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -21,7 +21,7 @@
+ 				Name: "origin",
+ 				URL:  "https://framagit.org/owner/infra",
+ 				Auth: types.Auth{
+-					AccessToken:     "my-secret",
++					AccessToken:     "",
+ 					AccessTokenPath: "./secret",
+ 					Username:        "comin",
+ 				},
+@@ -57,8 +57,8 @@
+ 		Grpc: types.Grpc{
+ 			UnixSocketPath: "/var/lib/comin/grpc.sock",
+ 		},
+-		EvalTimeout:    1800,
+-		BuildTimeout:   1800,
++		EvalTimeout:     1800,
++		BuildTimeout:    1800,
+ 		BuildRetryTimer: 30,
+ 	}
+ 	config, err := Read(configPath)
+diff --git a/internal/repository/git.go b/internal/repository/git.go
+--- a/internal/repository/git.go
++++ b/internal/repository/git.go
+@@ -79,17 +79,36 @@
+ 	return *head, commitObject.Message, nil
+ }
+ 
++func accessToken(auth types.Auth) (string, error) {
++	if auth.AccessTokenPath == "" {
++		return auth.AccessToken, nil
++	}
++	content, err := os.ReadFile(auth.AccessTokenPath)
++	if err != nil {
++		return "", fmt.Errorf("reading access token file: %w", err)
++	}
++	token := strings.TrimSpace(string(content))
++	if token == "" {
++		return "", errors.New("access token file is empty")
++	}
++	return token, nil
++}
++
+ // fetch fetches the config.Remote
+ func fetch(r repository, remote types.Remote) (err error) {
+ 	logrus.Debugf("Fetching remote '%s'", remote.Name)
+ 	fetchOptions := git.FetchOptions{
+ 		RemoteName: remote.Name,
+ 	}
++	token, err := accessToken(remote.Auth)
++	if err != nil {
++		return fmt.Errorf("credentials for remote %q: %w", remote.Name, err)
++	}
+ 	// TODO: support several authentication methods
+-	if remote.Auth.AccessToken != "" {
++	if token != "" {
+ 		fetchOptions.Auth = &http.BasicAuth{
+ 			Username: remote.Auth.Username,
+-			Password: remote.Auth.AccessToken,
++			Password: token,
+ 		}
+ 	} else if remote.Auth.SshDeployKeyPath != "" {
+ 		sshPubKeyAuth, err := ssh.NewPublicKeysFromFile(remote.Auth.Username, remote.Auth.SshDeployKeyPath, "")
+diff --git a/internal/repository/access_token_test.go b/internal/repository/access_token_test.go
+--- /dev/null
++++ b/internal/repository/access_token_test.go
+@@ -0,0 +1,42 @@
++package repository
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/nlewo/comin/internal/types"
++	"github.com/stretchr/testify/require"
++)
++
++func TestAccessTokenTracksAtomicReplacement(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "token")
++	auth := types.Auth{AccessTokenPath: path}
++	for _, value := range []string{"first-token", "rotated-token"} {
++		require.NoError(t, os.WriteFile(path+".new", []byte(value+"\n"), 0600))
++		require.NoError(t, os.Rename(path+".new", path))
++		token, err := accessToken(auth)
++		require.NoError(t, err)
++		require.Equal(t, value, token)
++	}
++}
++
++func TestAccessTokenRejectsUnavailableFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "token")
++	auth := types.Auth{AccessTokenPath: path, AccessToken: "stale-token"}
++	token, err := accessToken(auth)
++	require.Error(t, err)
++	require.Empty(t, token)
++	require.NoError(t, os.WriteFile(path, []byte(" \n"), 0600))
++	token, err = accessToken(auth)
++	require.Error(t, err)
++	require.Empty(t, token)
++}
++
++func TestAccessTokenWithoutFile(t *testing.T) {
++	for _, value := range []string{"", "configured-token"} {
++		token, err := accessToken(types.Auth{AccessToken: value})
++		require.NoError(t, err)
++		require.Equal(t, value, token)
++	}
++}

@@ -1,0 +1,392 @@
+diff --git a/internal/manager/generation_race_test.go b/internal/manager/generation_race_test.go
+new file mode 100644
+index 0000000..fa584ed
+--- /dev/null
++++ b/internal/manager/generation_race_test.go
+@@ -0,0 +1,105 @@
++package manager
++
++import (
++	"context"
++	"io"
++	"testing"
++	"time"
++
++	"github.com/nlewo/comin/internal/broker"
++	"github.com/nlewo/comin/internal/builder"
++	"github.com/nlewo/comin/internal/deployer"
++	"github.com/nlewo/comin/internal/fetcher"
++	"github.com/nlewo/comin/internal/prometheus"
++	"github.com/nlewo/comin/internal/scheduler"
++	"github.com/nlewo/comin/internal/store"
++	"github.com/nlewo/comin/internal/utils"
++	"github.com/nlewo/comin/pkg/protobuf"
++	"github.com/stretchr/testify/assert"
++)
++
++type generationRaceExecutor struct {
++	evalStarted  chan string
++	evalFinished chan struct{}
++	buildStarted chan struct{}
++}
++
++func (generationRaceExecutor) ReadMachineId() (string, error) { return "", nil }
++func (generationRaceExecutor) NeedToReboot(_, _ string) bool  { return false }
++func (generationRaceExecutor) IsStorePathExist(string) bool   { return false }
++func (generationRaceExecutor) Deploy(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error) {
++	return false, "", nil
++}
++func (e generationRaceExecutor) Eval(ctx context.Context, source *protobuf.Source, _, _ io.WriteCloser) (string, string, string, error) {
++	select {
++	case e.evalStarted <- source.GetGit().SelectedCommitId:
++	case <-ctx.Done():
++		return "", "", "", ctx.Err()
++	}
++	select {
++	case <-e.evalFinished:
++		return "drv-path", "out-path", "", nil
++	case <-ctx.Done():
++		return "", "", "", ctx.Err()
++	}
++}
++func (e generationRaceExecutor) Build(ctx context.Context, _ string, _, _ io.WriteCloser) error {
++	e.buildStarted <- struct{}{}
++	<-ctx.Done()
++	return ctx.Err()
++}
++
++func TestManagerStopsBuildBeforeCreatingFetchedGeneration(t *testing.T) {
++	repo := utils.NewRepositoryMock()
++	tmp := t.TempDir()
++	bk := broker.New()
++	bk.Start()
++	f := fetcher.NewGitFetcher(repo, bk)
++	f.Start(t.Context())
++	s, err := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
++	assert.NoError(t, err)
++	mock := generationRaceExecutor{
++		evalStarted:  make(chan string, 2),
++		evalFinished: make(chan struct{}, 1),
++		buildStarted: make(chan struct{}, 1),
++	}
++	b := builder.New(s, mock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second, 0, 30*time.Second, "")
++	defer b.Stop()
++	d := deployer.New(s, func(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error) {
++		return false, "", nil
++	}, nil, "", bk)
++	bc := NewConfirmer(bk, Without, 0, "")
++	bc.Start()
++	dc := NewConfirmer(bk, Without, 0, "")
++	dc.Start()
++	m := New(s, prometheus.New(), scheduler.New(), f, b, d, "", "", mock, bc, dc, bk, emptyConfigurationOperations)
++	go m.Run(t.Context())
++
++	f.TriggerFetch([]string{"remote"})
++	repo.RsCh <- &protobuf.GitRepositoryStatus{SelectedCommitId: "first"}
++	select {
++	case commit := <-mock.evalStarted:
++		assert.Equal(t, "first", commit)
++	case <-time.After(5 * time.Second):
++		t.Fatal("first evaluation did not start")
++	}
++	mock.evalFinished <- struct{}{}
++	select {
++	case <-mock.buildStarted:
++	case <-time.After(5 * time.Second):
++		t.Fatal("first build did not start")
++	}
++
++	f.TriggerFetch([]string{"remote"})
++	repo.RsCh <- &protobuf.GitRepositoryStatus{SelectedCommitId: "second"}
++	select {
++	case commit := <-mock.evalStarted:
++		assert.Equal(t, "second", commit)
++	case <-time.After(5 * time.Second):
++		t.Fatal("second evaluation did not start after stopping the first build")
++	}
++	state := b.State()
++	assert.Equal(t, "second", state.Generation.Source.GetGit().SelectedCommitId)
++	assert.Equal(t, store.Evaluating.String(), state.Generation.EvalStatus)
++	assert.True(t, state.IsEvaluating.GetValue())
++}
+diff --git a/internal/manager/manager.go b/internal/manager/manager.go
+index e6bc1ef..5ed251e 100644
+--- a/internal/manager/manager.go
++++ b/internal/manager/manager.go
+@@ -173,1 +173,2 @@
+-						logrus.Infof("manager: a generation is evaluating for commit %s", rs.SelectedCommitId)
++						logrus.Infof("manager: a generation is evaluating for commit %s", rs.SelectedCommitId)
++						m.Builder.Stop()
+diff --git a/internal/deployer/deployer.go b/internal/deployer/deployer.go
+--- a/internal/deployer/deployer.go
++++ b/internal/deployer/deployer.go
+@@ -171,3 +171,7 @@
+-	previous := d.previousDeployment.Load()
+-	if previous == nil {
+-		logrus.Infof("deployer: no previous deployment found for generation %s", generation.Uuid)
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return d.isAlreadyDeployed(generation, operation)
++}
++
++func (d *Deployer) isAlreadyDeployed(generation *protobuf.Generation, operation string) bool {
++	if d.isDeploying.Load() || d.GenerationToDeploy != nil {
+@@ -176,2 +180,3 @@
+-	if generation.OutPath != previous.Generation.OutPath {
+-		logrus.Infof("deployer: out path %s differs from previous out path %s for generation %s", generation.OutPath, previous.Generation.OutPath, generation.Uuid)
++	latest := d.deployment.Load()
++	if latest == nil {
++		logrus.Infof("deployer: no latest deployment found for generation %s", generation.Uuid)
+@@ -180,2 +185 @@
+-	if previous.Operation != operation {
+-		logrus.Infof("deployer: operation %s differs from previous operation %s for generation %s", operation, previous.Operation, generation.Uuid)
++	if latest.Status != store.StatusToString(store.Done) {
+@@ -183,0 +188,8 @@
++	if generation.OutPath != latest.Generation.OutPath {
++		logrus.Infof("deployer: out path %s differs from latest out path %s for generation %s", generation.OutPath, latest.Generation.OutPath, generation.Uuid)
++		return false
++	}
++	if latest.Operation != operation {
++		logrus.Infof("deployer: operation %s differs from latest operation %s for generation %s", operation, latest.Operation, generation.Uuid)
++		return false
++	}
+@@ -201 +213,2 @@
+-	if force || !d.IsAlreadyDeployed(generation, operation) {
++	if force || !d.isAlreadyDeployed(generation, operation) {
++		pending := d.GenerationToDeploy != nil
+@@ -204,0 +218,3 @@
++		if pending {
++			return
++		}
+@@ -228,0 +245,2 @@
++			reason := d.Reason
++			d.isDeploying.Store(true)
+@@ -233 +251 @@
+-			dpl := d.store.NewDeployment(g, operationSubmitted, d.Reason, booted, current)
++			dpl := d.store.NewDeployment(g, operationSubmitted, reason, booted, current)
+@@ -238 +255,0 @@
+-			d.isDeploying.Store(true)
+@@ -273,0 +291 @@
++			d.mu.Lock()
+@@ -275,0 +294 @@
++			d.mu.Unlock()
+diff --git a/internal/deployer/current_deployment_test.go b/internal/deployer/current_deployment_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/deployer/current_deployment_test.go
+@@ -0,0 +1,106 @@
++package deployer
++
++import (
++	"context"
++	"errors"
++	"io"
++	"testing"
++	"time"
++
++	"github.com/nlewo/comin/internal/broker"
++	"github.com/nlewo/comin/internal/store"
++	"github.com/nlewo/comin/pkg/protobuf"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestDeployerComparesLatestCompletedDeployment(t *testing.T) {
++	bk := broker.New()
++	bk.Start()
++	tmp := t.TempDir()
++	s, err := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
++	require.NoError(t, err)
++	started := make(chan string, 1)
++	finish := make(chan error, 1)
++	d := New(s, func(_ context.Context, out, _ string, _ []string, _, _ io.WriteCloser) (bool, string, error) {
++		started <- out
++		return false, "profile-path", <-finish
++	}, nil, "", bk)
++	d.Run(t.Context())
++	a := &protobuf.Generation{Uuid: "a", OutPath: "out-a"}
++	b := &protobuf.Generation{Uuid: "b", OutPath: "out-b"}
++	deploy := func(g *protobuf.Generation, failure error) {
++		t.Helper()
++		d.Submit(g, "switch", true, "")
++		select {
++		case out := <-started:
++			require.Equal(t, g.OutPath, out)
++		case <-time.After(time.Second):
++			t.Fatal("deployment did not start")
++		}
++		finish <- failure
++		select {
++		case <-d.DeploymentDoneCh:
++		case <-time.After(time.Second):
++			t.Fatal("deployment did not finish")
++		}
++	}
++	require.False(t, d.IsAlreadyDeployed(a, "switch"), "first deployment must run")
++	deploy(a, nil)
++	deploy(b, nil)
++	// Submit uses this same comparison, and manager uses it before building.
++	assert.True(t, d.IsAlreadyDeployed(b, "switch"), "A -> B -> B must skip unchanged closure")
++	assert.False(t, d.IsAlreadyDeployed(a, "switch"), "A -> B -> A must deploy revert")
++	d.Submit(b, "switch", false, "")
++	require.Nil(t, d.GenerationToDeploy, "unchanged closure must not be queued")
++	d.Submit(a, "switch", false, "")
++	select {
++	case out := <-started:
++		require.Equal(t, a.OutPath, out, "revert must reach activation")
++	case <-time.After(time.Second):
++		t.Fatal("revert did not start")
++	}
++	finish <- nil
++	<-d.DeploymentDoneCh
++	deploy(b, nil)
++	deploy(b, errors.New("activation failed"))
++	assert.False(t, d.IsAlreadyDeployed(b, "switch"), "failed activation must remain retryable")
++	d.Submit(a, "switch", true, "")
++	select {
++	case <-started:
++	case <-time.After(time.Second):
++		t.Fatal("deployment did not start")
++	}
++	assert.False(t, d.IsAlreadyDeployed(b, "switch"), "previous closure cannot suppress a submission during activation")
++	assert.False(t, d.IsAlreadyDeployed(a, "switch"), "running activation is not yet successful")
++	finish <- nil
++	<-d.DeploymentDoneCh
++}
++
++func TestDeployerRestoredDeploymentComparison(t *testing.T) {
++	for _, tc := range []struct {
++		name, status, deployedOperation, requestedOperation string
++		want                                                bool
++	}{
++		{"successful switch", "done", "switch", "switch", true},
++		{"successful boot", "done", "boot", "boot", true},
++		{"boot must not suppress switch", "done", "boot", "switch", false},
++		{"switch must not suppress boot", "done", "switch", "boot", false},
++		{"failed", "failed", "switch", "switch", false},
++		{"running", "running", "switch", "switch", false},
++		{"initialized", "init", "switch", "switch", false},
++		{"inhibited test", "done", "null", "test", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			bk := broker.New()
++			tmp := t.TempDir()
++			s, err := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
++			require.NoError(t, err)
++			g := &protobuf.Generation{OutPath: "out-a"}
++			previous := &protobuf.Deployment{Generation: g, Operation: tc.deployedOperation, Status: tc.status}
++			d := New(s, nil, previous, "", bk)
++			require.Equal(t, tc.want, d.IsAlreadyDeployed(g, tc.requestedOperation))
++			assert.False(t, d.IsAlreadyDeployed(&protobuf.Generation{OutPath: "out-b"}, tc.requestedOperation))
++		})
++	}
++}
+diff --git a/internal/deployer/queued_deployment_test.go b/internal/deployer/queued_deployment_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/deployer/queued_deployment_test.go
+@@ -0,0 +1,104 @@
++package deployer
++
++import (
++	"context"
++	"io"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/nlewo/comin/internal/broker"
++	"github.com/nlewo/comin/internal/store"
++	"github.com/nlewo/comin/pkg/protobuf"
++	"github.com/sirupsen/logrus"
++	"github.com/stretchr/testify/require"
++)
++
++func TestDeployerQueuedRevertWins(t *testing.T) {
++	bk := broker.New()
++	bk.Start()
++	tmp := t.TempDir()
++	s, err := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
++	require.NoError(t, err)
++	started := make(chan string, 2)
++	d := New(s, func(_ context.Context, out, _ string, _ []string, _, _ io.WriteCloser) (bool, string, error) {
++		started <- out
++		return false, "", nil
++	}, nil, "", bk)
++	d.Run(t.Context())
++	a := &protobuf.Generation{Uuid: "a", OutPath: "out-a"}
++	b := &protobuf.Generation{Uuid: "b", OutPath: "out-b"}
++	d.Submit(a, "switch", false, "")
++	select {
++	case <-d.DeploymentDoneCh:
++	case <-time.After(time.Second):
++		t.Fatal("A did not finish")
++	}
++	require.Equal(t, "out-a", <-started)
++	d.Suspend("hold activation")
++	d.Submit(b, "switch", false, "")
++	require.Eventually(t, d.RunnerIsSuspended, time.Second, time.Millisecond)
++	d.Submit(a, "switch", false, "")
++	d.Submit(b, "switch", false, "")
++	d.Submit(a, "switch", false, "")
++	require.Equal(t, "out-a", d.State().GenerationToDeploy.OutPath)
++	d.Resume()
++	select {
++	case got := <-started:
++		require.Equal(t, "out-a", got, "latest requested A must replace queued B")
++	case <-time.After(time.Second):
++		t.Fatal("latest queued request did not activate")
++	}
++	select {
++	case <-d.DeploymentDoneCh:
++	case <-time.After(time.Second):
++		t.Fatal("latest queued request did not finish")
++	}
++	require.Nil(t, d.State().GenerationToDeploy)
++	select {
++	case got := <-started:
++		t.Fatalf("duplicate activation of %s", got)
++	case <-time.After(20 * time.Millisecond):
++	}
++}
++
++func TestDeployerComparisonDuringActivation(t *testing.T) {
++	previousLevel := logrus.GetLevel()
++	logrus.SetLevel(logrus.FatalLevel)
++	defer logrus.SetLevel(previousLevel)
++	bk := broker.New()
++	bk.Start()
++	tmp := t.TempDir()
++	s, err := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
++	require.NoError(t, err)
++	d := New(s, func(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error) {
++		return false, "", nil
++	}, nil, "", bk)
++	d.Run(t.Context())
++	g := &protobuf.Generation{Uuid: "a", OutPath: "out-a"}
++	stop := make(chan struct{})
++	var readers sync.WaitGroup
++	for range 4 {
++		readers.Add(1)
++		go func() {
++			defer readers.Done()
++			for {
++				select {
++				case <-stop:
++					return
++				default:
++					d.IsAlreadyDeployed(g, "switch")
++				}
++			}
++		}()
++	}
++	defer func() { close(stop); readers.Wait() }()
++	for range 1000 {
++		d.Submit(g, "switch", true, "")
++		select {
++		case <-d.DeploymentDoneCh:
++		case <-time.After(time.Second):
++			t.Fatal("deployment did not finish")
++		}
++	}
++}

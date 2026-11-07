@@ -1,0 +1,253 @@
+diff --git a/crates/system-manager-engine/src/activate.rs b/crates/system-manager-engine/src/activate.rs
+index fce3d8d..f94cd63 100644
+--- a/crates/system-manager-engine/src/activate.rs
++++ b/crates/system-manager-engine/src/activate.rs
+@@ -150,7 +150,8 @@ pub fn activate(store_path: &StorePath, ephemeral: bool) -> Result<()> {
+             services::restart_sysinit_reactivation_target()?;
+
+             // Restart userborn before tmpfiles so users exist when tmpfiles runs
+-            if let Err(e) = services::restart_userborn_if_exists() {
++            let userborn_result = services::restart_userborn_if_exists();
++            if let Err(e) = &userborn_result {
+                 log::error!("Error restarting userborn.service: {e}");
+             }
+
+@@ -164,28 +165,27 @@ pub fn activate(store_path: &StorePath, ephemeral: bool) -> Result<()> {
+             }
+
+             log::info!("Activating systemd services...");
+-            let final_state = match services::activate(store_path, old_state.services, ephemeral) {
+-                Ok(services) => StateV1 {
+-                    file_tree: etc_tree,
+-                    services,
+-                    version: 1,
+-                },
+-                Err(ActivationError::WithPartialResult { result, source }) => {
+-                    log::error!("Error during activation: {source:?}");
+-                    StateV1 {
+-                        file_tree: etc_tree,
+-                        services: result,
+-                        version: 1,
++            let (services, services_result) =
++                match services::activate(store_path, old_state.services, ephemeral) {
++                    Ok(services) => (services, Ok(())),
++                    Err(ActivationError::WithPartialResult { result, source }) => {
++                        log::error!("Error during activation: {source:?}");
++                        (result, Err(source))
+                     }
+-                }
++                };
++            let final_state = StateV1 {
++                file_tree: etc_tree,
++                services,
++                version: 1,
+             };
+             final_state.write_to_file(state_file)?;
+
++            userborn_result?;
+             if let Err(e) = tmp_result {
+                 return Err(e.into());
+             }
+
+-            Ok(())
++            services_result
+         }
+         Err(ActivationError::WithPartialResult { result, source }) => {
+             log::error!("Error during activation: {source:?}");
+@@ -195,7 +195,7 @@ pub fn activate(store_path: &StorePath, ephemeral: bool) -> Result<()> {
+                 ..old_state
+             };
+             final_state.write_to_file(state_file)?;
+-            Ok(())
++            Err(source)
+         }
+     }
+ }
+diff --git a/crates/system-manager-engine/src/activate/services.rs b/crates/system-manager-engine/src/activate/services.rs
+index 3b57032..b293d1c 100644
+--- a/crates/system-manager-engine/src/activate/services.rs
++++ b/crates/system-manager-engine/src/activate/services.rs
+@@ -89,19 +89,20 @@ pub fn activate(
+     // still knows about these units.
+     let mut units_to_stop = convert_services(&services_to_stop);
+     units_to_stop.extend(convert_services(&masked));
+-    wait_for_jobs(
+-        &service_manager,
+-        &job_monitor,
+-        stop_services(&service_manager, units_to_stop),
+-        &timeout,
+-    )
+-    .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?;
++    let stop_jobs = stop_services(&service_manager, units_to_stop)
++        .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?;
++    wait_for_jobs(&service_manager, &job_monitor, stop_jobs, &timeout)
++        .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?;
+
++    let reload_jobs =
++        reload_or_restart_units(&service_manager, convert_services(&services_to_reload))
++            .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?;
++    let start_jobs = start_units(&service_manager, ["system-manager.target"])
++        .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?;
+     wait_for_jobs(
+         &service_manager,
+         &job_monitor,
+-        reload_or_restart_units(&service_manager, convert_services(&services_to_reload))
+-            + start_units(&service_manager, ["system-manager.target"]),
++        reload_jobs + start_jobs,
+         &timeout,
+     )
+     .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?;
+@@ -125,6 +126,24 @@ pub fn activate(
+         );
+     }
+
++    let failed = service_manager
++        .list_units_by_patterns(&[], &[])
++        .map_err(|e| ActivationError::with_partial_result(services.clone(), e))?
++        .into_iter()
++        .filter(|unit| {
++            active.contains_key(&unit.name)
++                && (unit.active_state == "failed"
++                    || ["error", "bad-setting", "not-found"].contains(&unit.load_state.as_str()))
++        })
++        .map(|unit| unit.name)
++        .collect::<Vec<_>>();
++    if !failed.is_empty() {
++        return Err(ActivationError::with_partial_result(
++            services,
++            anyhow::anyhow!("Managed units failed: {}", failed.join(", ")),
++        ));
++    }
++
+     log::info!("Done");
+     Ok(services)
+ }
+@@ -253,14 +272,11 @@ pub fn deactivate(old_services: Services) -> ServiceActivationResult {
+         units_to_stop.push("system-manager.target");
+         // We need to do this before we reload the systemd daemon, so that the daemon
+         // still knows about these units.
+-        wait_for_jobs(
+-            &service_manager,
+-            &job_monitor,
+-            stop_services(&service_manager, units_to_stop),
+-            &timeout,
+-        )
+-        // We consider all jobs stopped now..
+-        .map_err(|e| ActivationError::with_partial_result(im::HashMap::new(), e))?;
++        let stop_jobs = stop_services(&service_manager, units_to_stop)
++            .map_err(|e| ActivationError::with_partial_result(old_services.clone(), e))?;
++        wait_for_jobs(&service_manager, &job_monitor, stop_jobs, &timeout)
++            // We consider all jobs stopped now..
++            .map_err(|e| ActivationError::with_partial_result(im::HashMap::new(), e))?;
+     } else {
+         log::info!("No services to deactivate.");
+     }
+@@ -310,17 +326,30 @@ fn restore_ephemeral_system_dir() -> anyhow::Result<()> {
+     Ok(())
+ }
+
+-fn stop_services<'a, U>(service_manager: &systemd::ServiceManager, units: U) -> HashSet<JobId>
++fn stop_services<'a, U>(
++    service_manager: &systemd::ServiceManager,
++    units: U,
++) -> anyhow::Result<HashSet<JobId>>
+ where
+     U: AsRef<[&'a str]>,
+ {
+-    for_each_unit(|s| service_manager.stop_unit(s), units.as_ref(), "stopping")
++    // Retired units can be unloaded after their /etc files are removed.
++    let loaded = service_manager.list_units_by_patterns(&[], &[])?;
++    let stoppable = units
++        .as_ref()
++        .iter()
++        .copied()
++        .filter(|name| {
++            loaded.iter().any(|unit| unit.name == *name && (unit.load_state != "not-found" || unit.active_state != "inactive"))
++        })
++        .collect::<Vec<_>>();
++    for_each_unit(|s| service_manager.stop_unit(s), stoppable, "stopping")
+ }
+
+ fn reload_or_restart_units<'a, U>(
+     service_manager: &systemd::ServiceManager,
+     units: U,
+-) -> HashSet<JobId>
++) -> anyhow::Result<HashSet<JobId>>
+ where
+     U: AsRef<[&'a str]>,
+ {
+@@ -331,7 +360,10 @@ where
+     )
+ }
+
+-fn start_units<'a, U>(service_manager: &systemd::ServiceManager, units: U) -> HashSet<JobId>
++fn start_units<'a, U>(
++    service_manager: &systemd::ServiceManager,
++    units: U,
++) -> anyhow::Result<HashSet<JobId>>
+ where
+     U: AsRef<[&'a str]>,
+ {
+@@ -346,32 +378,26 @@ fn convert_services(services: &Services) -> Vec<&str> {
+     services.keys().map(AsRef::as_ref).collect::<Vec<&str>>()
+ }
+
+-fn for_each_unit<'a, F, R, S>(action: F, units: S, log_action: &str) -> HashSet<JobId>
++fn for_each_unit<'a, F, R, S>(
++    action: F,
++    units: S,
++    log_action: &str,
++) -> anyhow::Result<HashSet<JobId>>
+ where
+     F: Fn(&str) -> anyhow::Result<R>,
+     S: AsRef<[&'a str]>,
+ {
+-    // TODO: do we want to propagate unit failures here in some way?
+     units
+         .as_ref()
+         .iter()
+-        .fold(HashSet::new(), |mut set, unit| match action(unit) {
+-            Ok(_) => {
+-                log::debug!("Unit {}: {}...", unit, log_action);
+-                set.insert(JobId {
+-                    id: (*unit).to_owned(),
+-                });
+-                set
+-            }
+-            Err(e) => {
+-                log::error!(
+-                    "Service {}: error {log_action}, please consult the logs",
+-                    unit
+-                );
+-                log::error!("{e}");
+-                set
+-            }
++        .map(|unit| {
++            action(unit).with_context(|| format!("Service {unit}: error {log_action}"))?;
++            log::debug!("Unit {}: {}...", unit, log_action);
++            Ok(JobId {
++                id: (*unit).to_owned(),
++            })
+         })
++        .collect()
+ }
+
+ fn wait_for_jobs(
+@@ -409,7 +435,7 @@ pub fn restart_sysinit_reactivation_target() -> anyhow::Result<()> {
+         |unit| service_manager.restart_unit(unit),
+         ["sysinit-reactivation.target"],
+         "restarting",
+-    );
++    )?;
+
+     wait_for_jobs(&service_manager, &job_monitor, jobs, &timeout)?;
+     Ok(())
+@@ -439,7 +465,7 @@ pub fn restart_userborn_if_exists() -> anyhow::Result<()> {
+         |unit| service_manager.restart_unit(unit),
+         ["userborn.service"],
+         "restarting",
+-    );
++    )?;
+
+     wait_for_jobs(&service_manager, &job_monitor, jobs, &timeout)?;
+     log::info!("userborn.service completed");

@@ -6,9 +6,11 @@ Patched builds of upstream packages that [alxleo/homelab](https://github.com/alx
 |---|---|---|---|
 | `atlantis` | nixos-unstable | policy-check DB writes keep completed plan status | upstream Atlantis keeps plan status across policy checks |
 | `gitea` | nixos-unstable | opt-in `RETRY_PACKAGE_DELIVERIES` keeps failed package-event webhooks queued | upstream Gitea retries package-event deliveries |
+| `comin` | nixos-26.05, x86_64 and aarch64 | no garbage-collected mid-build generations; rereads the rotating access token; root-only gRPC socket | upstream covers each fix (drop patches one by one) |
+| `system-manager` (overlay) | nixos-26.05 | failed service or Userborn restarts fail activation | upstream activation reports those failures |
 
 Everything stays pinned: nothing here updates on its own. Each recipe asserts the upstream version its patch was written for, and Renovate opens a PR when upstream releases a newer one. That PR fails its build until someone moves the nixpkgs pin and either drops the patch (fixed upstream) or rebases it.
 
 | Workflow | When | What |
 |---|---|---|
-| Build | push, pull request | `nix flake check` builds and tests every package |
+| Build | push, pull request | `nix flake check` on x86_64 and aarch64 builds and tests every package |
