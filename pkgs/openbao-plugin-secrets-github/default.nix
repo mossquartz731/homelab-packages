@@ -6,7 +6,7 @@
 let
   pname = "openbao-plugin-secrets-github";
   # renovate: datasource=github-releases depName=rknightion/openbao-plugin-secrets-github
-  version = "0.1.3";
+  version = "0.1.5";
   arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${stdenvNoCC.hostPlatform.system};
   hash = {
     amd64 = "sha256:69b43aba01437d49c6bd2b3f037314278c3de0aafffc829eba129e87766f030b";
