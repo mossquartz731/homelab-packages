@@ -6,7 +6,7 @@
 # release's checksums.txt.
 let
   # renovate: datasource=gitea-releases depName=gitea/runner
-  version = "5.2.4";
+  version = "5.4.1";
   arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${stdenvNoCC.hostPlatform.system};
   hash = {
     amd64 = "sha256:674145e627e5c879d72c293a08991458cf73c81124e54afdd40cf6995098a01b";
