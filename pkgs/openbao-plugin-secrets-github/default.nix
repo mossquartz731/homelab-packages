@@ -1,8 +1,8 @@
 { lib, stdenvNoCC, fetchurl }:
 
 # The project's official static binary, unbuilt; nixpkgs lacks the plugin. A
-# Renovate PR moving the version fails on the stale hashes until they are
-# refreshed from the release's checksums.txt.
+# Renovate PR moving the version fails on the stale hashes until they and the
+# revision are refreshed from the release.
 let
   pname = "openbao-plugin-secrets-github";
   # renovate: datasource=github-releases depName=rknightion/openbao-plugin-secrets-github
@@ -24,6 +24,8 @@ stdenvNoCC.mkDerivation {
   passthru = {
     pluginType = "secret";
     pluginName = "github";
+    # The commit the release binary reports; homelab's qualification check expects it.
+    revision = "aaceee6ee546c177f448035ce95528d33fe08d4c";
   };
   meta = {
     description = "OpenBao GitHub App installation-token engine";
