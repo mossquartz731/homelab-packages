@@ -46,6 +46,8 @@
         openbao-plugin-secrets-github = openbaoPluginFor "aarch64-linux";
       };
 
-      checks = self.packages;
+      # gitea.com refuses GitHub-hosted runners, so the Gitea runner is only
+      # evaluated here; homelab's own builders fetch and build it.
+      checks = builtins.mapAttrs (_: packages: removeAttrs packages [ "gitea-runner" ]) self.packages;
     };
 }
