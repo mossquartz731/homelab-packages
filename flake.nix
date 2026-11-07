@@ -5,8 +5,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Comin and System Manager build against homelab's stable release.
     nixpkgs-stable.url = "github:NixOS/nixpkgs/nixos-26.05";
-    # The OpenBao plugin builds with the toolchain of homelab's OpenBao pin.
-    nixpkgs-openbao.url = "github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473";
     comin = {
       url = "github:nlewo/comin/1399adecc682e557bc3ee914d929f8e20391a148";
       inputs.nixpkgs.follows = "nixpkgs-stable";
@@ -17,13 +15,14 @@
     };
   };
 
-  outputs = { self, nixpkgs, nixpkgs-stable, nixpkgs-openbao, comin, system-manager }:
+  outputs = { self, nixpkgs, nixpkgs-stable, comin, system-manager }:
     let
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
       cominFor = system: import ./pkgs/comin comin.packages.${system}.default;
-      giteaRunnerFor = system: import ./pkgs/gitea-runner { pkgs = nixpkgs-stable.legacyPackages.${system}; };
+      # Official release binaries, downloaded rather than built.
+      giteaRunnerFor = system: nixpkgs-stable.legacyPackages.${system}.callPackage ./pkgs/gitea-runner { };
       openbaoPluginFor = system:
-        import ./pkgs/openbao-plugin-secrets-github { pkgs = nixpkgs-openbao.legacyPackages.${system}; };
+        nixpkgs-stable.legacyPackages.${system}.callPackage ./pkgs/openbao-plugin-secrets-github { };
       systemManagerFor = system:
         (import nixpkgs-stable { inherit system; overlays = [ self.overlays.system-manager ]; }).callPackage
           "${system-manager}/package.nix" { };
@@ -46,8 +45,8 @@
         openbao-plugin-secrets-github = openbaoPluginFor "aarch64-linux";
       };
 
-      # gitea.com refuses GitHub-hosted runners, so the Gitea runner is only
-      # evaluated here; homelab's own builders fetch and build it.
+      # gitea.com refuses GitHub-hosted runners, so the Gitea runner's download
+      # is only evaluated here; homelab's machines fetch it.
       checks = builtins.mapAttrs (_: packages: removeAttrs packages [ "gitea-runner" ]) self.packages;
     };
 }

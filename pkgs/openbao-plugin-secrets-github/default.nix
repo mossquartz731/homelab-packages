@@ -1,37 +1,35 @@
-{ pkgs }:
+{ lib, stdenvNoCC, fetchurl }:
 
-# Not in nixpkgs. A Renovate PR moving the version needs the matching rev and
-# hashes too.
-pkgs.buildGo127Module rec {
+# The project's official static binary, unbuilt; nixpkgs lacks the plugin. A
+# Renovate PR moving the version fails on the stale hashes until they are
+# refreshed from the release's checksums.txt.
+let
   pname = "openbao-plugin-secrets-github";
   # renovate: datasource=github-releases depName=rknightion/openbao-plugin-secrets-github
   version = "0.1.3";
-  src = pkgs.fetchFromGitHub {
-    owner = "rknightion";
-    repo = pname;
-    rev = "aaceee6ee546c177f448035ce95528d33fe08d4c";
-    hash = "sha256-JkyNjfQ9f/ofn3zT5040cL23lFUrRAMKN90RRmq0BL4=";
+  arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${stdenvNoCC.hostPlatform.system};
+  hash = {
+    amd64 = "sha256:69b43aba01437d49c6bd2b3f037314278c3de0aafffc829eba129e87766f030b";
+    arm64 = "sha256:5e5fe8e7210ef809b38d1ad4fcb5cb62e9eb9502c870390c25a3d1fd3eee9fa6";
+  }.${arch};
+in
+stdenvNoCC.mkDerivation {
+  inherit pname version;
+  src = fetchurl {
+    url = "https://github.com/rknightion/${pname}/releases/download/v${version}/${pname}_linux_${arch}";
+    inherit hash;
   };
-  vendorHash = "sha256-SKqLvVEbEXG98JkDPaq5uyJCTe13+O/Eb7YFSPI8RwA=";
-  subPackages = [ "." ];
-  env.CGO_ENABLED = 0;
+  dontUnpack = true;
+  installPhase = "install -Dm755 $src $out/bin/${pname}";
   passthru = {
     pluginType = "secret";
     pluginName = "github";
   };
-  ldflags = [
-    "-s"
-    "-w"
-    "-X github.com/rknightion/openbao-plugin-secrets-github/github.projectVersion=v${version}"
-    "-X github.com/rknightion/openbao-plugin-secrets-github/github.projectName=${pname}"
-    "-X github.com/prometheus/common/version.Version=v${version}"
-    "-X github.com/prometheus/common/version.Revision=aaceee6ee546c177f448035ce95528d33fe08d4c"
-  ];
   meta = {
     description = "OpenBao GitHub App installation-token engine";
     homepage = "https://github.com/rknightion/openbao-plugin-secrets-github";
-    license = pkgs.lib.licenses.asl20;
-    platforms = pkgs.lib.platforms.linux;
+    license = lib.licenses.asl20;
+    platforms = lib.platforms.linux;
     mainProgram = pname;
   };
 }

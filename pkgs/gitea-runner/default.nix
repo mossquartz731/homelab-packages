@@ -1,20 +1,26 @@
-{ pkgs }:
+{ stdenvNoCC, fetchurl }:
 
-# Use nixpkgs' own runner once it carries the 5.x line. A Renovate PR moving
-# the version fails on the stale hashes until they are refreshed.
-(pkgs.gitea-actions-runner.override {
-  buildGoModule = pkgs.buildGo127Module;
-}).overrideAttrs (finalAttrs: _oldAttrs: {
+# Gitea's official static binary, unbuilt: nixpkgs ships only the 3.x runner.
+# Use nixpkgs' own once it carries the 5.x line. A Renovate PR moving the
+# version fails on the stale hashes until they are refreshed from the
+# release's checksums.txt.
+let
   # renovate: datasource=gitea-releases depName=gitea/runner
   version = "5.2.4";
-  # Named after the version so a bump with a stale hash cannot reuse the old source.
-  src = pkgs.fetchFromGitea {
-    name = "gitea-runner-${finalAttrs.version}-source";
-    domain = "gitea.com";
-    owner = "gitea";
-    repo = "runner";
-    rev = "v${finalAttrs.version}";
-    hash = "sha256-hwhkgVPT1deu6o0/20O0nAUHij7PTzRea0f2UYez2Kg=";
+  arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${stdenvNoCC.hostPlatform.system};
+  hash = {
+    amd64 = "sha256:674145e627e5c879d72c293a08991458cf73c81124e54afdd40cf6995098a01b";
+    arm64 = "sha256:035de0952d4f024f9efdd7f747ae2a3239b47552a50a2c901b2d74f1500e2c7c";
+  }.${arch};
+in
+stdenvNoCC.mkDerivation {
+  pname = "gitea-runner";
+  inherit version;
+  src = fetchurl {
+    url = "https://gitea.com/gitea/runner/releases/download/v${version}/gitea-runner-${version}-linux-${arch}";
+    inherit hash;
   };
-  vendorHash = "sha256-MobDUw9qnjLVm/uX0BJil+DdgnC30ek3pfvVOmNC09I=";
-})
+  dontUnpack = true;
+  installPhase = "install -Dm755 $src $out/bin/gitea-runner";
+  meta.mainProgram = "gitea-runner";
+}
