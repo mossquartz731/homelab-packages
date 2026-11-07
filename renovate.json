@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "nix": { "enabled": false },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/\\.nix$/"],
+      "matchStrings": ["# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n.*?\"(?<currentValue>[^\"]+)\""],
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
+  ]
+}
