@@ -42,6 +42,7 @@
       };
       packages.aarch64-linux = {
         comin = cominFor "aarch64-linux";
+        gitea-runner = giteaRunnerFor "aarch64-linux";
         openbao-plugin-secrets-github = openbaoPluginFor "aarch64-linux";
       };
 
