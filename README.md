@@ -1,6 +1,6 @@
 # homelab-packages
 
-Patched builds of upstream packages that [alxleo/homelab](https://github.com/alxleo/homelab) consumes as a flake input. Homelab carries no patches of its own; each fix lives here until upstream has it.
+Patched builds of upstream packages exposed as a Nix flake. Each patch stays here until the corresponding fix lands upstream.
 
 | Package | Base | Fix | Retire when |
 |---|---|---|---|
