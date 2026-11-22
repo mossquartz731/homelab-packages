@@ -1,0 +1,725 @@
+diff --git a/cmd/server.go b/cmd/server.go
+index 3430fc7..22c5f42 100644
+--- a/cmd/server.go
++++ b/cmd/server.go
+@@ -165,6 +165,9 @@ const (
+ 	WebBasicAuthFlag                 = "web-basic-auth"
+ 	WebUsernameFlag                  = "web-username"
+ 	WebPasswordFlag                  = "web-password"
++	WebUITrustedProxyFlag            = "web-ui-trusted-proxy"
++	WebUIUserHeaderFlag              = "web-ui-user-header"
++	WebUIUserMapFlag                 = "web-ui-user-map"
+ 	EnableDriftDetectionFlag         = "enable-drift-detection"
+ 	EnableDriftRemediationFlag       = "enable-drift-remediation"
+ 	WebsocketCheckOrigin             = "websocket-check-origin"
+@@ -539,6 +542,15 @@ var stringFlags = map[string]stringFlag{
+ 		description:  "Password used for Web Basic Authentication on Atlantis HTTP Middleware",
+ 		defaultValue: DefaultWebPassword,
+ 	},
++	WebUITrustedProxyFlag: {
++		description: "Single trusted reverse-proxy IP allowed to supply the authenticated web UI user header.",
++	},
++	WebUIUserHeaderFlag: {
++		description: "Header containing the authenticated web UI username. It is ignored unless the request came from --web-ui-trusted-proxy.",
++	},
++	WebUIUserMapFlag: {
++		description: "Comma-separated authenticated-user=VCS-user mappings for web UI actions.",
++	},
+ }
+ 
+ var boolFlags = map[string]boolFlag{
+diff --git a/server/controllers/apply_controller.go b/server/controllers/apply_controller.go
+new file mode 100644
+index 0000000..ed5423b
+--- /dev/null
++++ b/server/controllers/apply_controller.go
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Atlantis Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package controllers
++
++import (
++	"fmt"
++	"net"
++	"net/http"
++	"net/netip"
++	"net/url"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++
++	"github.com/runatlantis/atlantis/server/controllers/web_templates"
++	"github.com/runatlantis/atlantis/server/events"
++	"github.com/runatlantis/atlantis/server/events/command"
++	"github.com/runatlantis/atlantis/server/events/models"
++	"github.com/runatlantis/atlantis/server/logging"
++)
++
++var lowercaseSHA = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
++
++type ApplyController struct {
++	AtlantisURL          *url.URL
++	Logger               logging.SimpleLogging
++	CommandRunner        events.CommandRunner
++	RepoAllowlistChecker *events.RepoAllowlistChecker
++	GithubHostname       string
++	UserHeader           string
++	TrustedProxy         netip.Addr
++	UserMap              map[string]string
++	Template             web_templates.TemplateWriter
++}
++
++type applyRequest struct {
++	repo      models.Repo
++	pull      int
++	project   string
++	dir       string
++	workspace string
++	head      string
++	plan      string
++	actor     string
++}
++
++func ParseWebUIUserMap(value string) (map[string]string, error) {
++	result := map[string]string{}
++	for _, mapping := range strings.Split(value, ",") {
++		if strings.TrimSpace(mapping) == "" {
++			continue
++		}
++		parts := strings.Split(mapping, "=")
++		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
++			return nil, fmt.Errorf("invalid web UI user mapping %q", mapping)
++		}
++		result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
++	}
++	return result, nil
++}
++
++func (a *ApplyController) request(r *http.Request) (applyRequest, error) {
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil || !a.TrustedProxy.IsValid() || net.ParseIP(host) == nil || netip.MustParseAddr(host) != a.TrustedProxy {
++		return applyRequest{}, fmt.Errorf("request did not come from the trusted authentication proxy")
++	}
++	authenticated := strings.TrimSpace(r.Header.Get(a.UserHeader))
++	actor, ok := a.UserMap[authenticated]
++	if !ok {
++		return applyRequest{}, fmt.Errorf("authenticated user is not mapped to a VCS identity")
++	}
++	repoFullName := r.FormValue("repo")
++	owner, name := models.SplitRepoFullName(repoFullName)
++	pull, err := strconv.Atoi(r.FormValue("pull"))
++	if owner == "" || name == "" || pull < 1 || err != nil {
++		return applyRequest{}, fmt.Errorf("invalid repository or pull request")
++	}
++	if !a.RepoAllowlistChecker.IsAllowlisted(repoFullName, a.GithubHostname) {
++		return applyRequest{}, fmt.Errorf("repository is not allowlisted")
++	}
++	dir := r.FormValue("dir")
++	if dir == "" || filepath.Clean(dir) != dir || strings.HasPrefix(dir, "..") || strings.ContainsAny(dir, "\r\n") {
++		return applyRequest{}, fmt.Errorf("invalid project directory")
++	}
++	project := r.FormValue("project")
++	workspace := r.FormValue("workspace")
++	head := r.FormValue("head")
++	plan := r.FormValue("plan")
++	if workspace == "" || strings.ContainsAny(project+workspace, "\r\n") || !lowercaseSHA.MatchString(head) || len(head) != 40 || !lowercaseSHA.MatchString(plan) || len(plan) != 64 {
++		return applyRequest{}, fmt.Errorf("invalid saved plan identity")
++	}
++	cloneURL := fmt.Sprintf("https://%s/%s.git", a.GithubHostname, repoFullName)
++	repo := models.Repo{FullName: repoFullName, Owner: owner, Name: name, CloneURL: cloneURL, SanitizedCloneURL: cloneURL, VCSHost: models.VCSHost{Type: models.Github, Hostname: a.GithubHostname}}
++	return applyRequest{repo: repo, pull: pull, project: project, dir: dir, workspace: workspace, head: head, plan: plan, actor: actor}, nil
++}
++
++func (a *ApplyController) sameOrigin(r *http.Request) bool {
++	origin, err := url.Parse(r.Header.Get("Origin"))
++	return err == nil && origin.Scheme == a.AtlantisURL.Scheme && origin.Host == a.AtlantisURL.Host
++}
++
++func (a *ApplyController) Apply(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Cache-Control", "no-store")
++	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
++	request, err := a.request(r)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusForbidden)
++		return
++	}
++	requested := false
++	if r.Method == http.MethodPost {
++		if !a.sameOrigin(r) {
++			http.Error(w, "cross-origin apply confirmation refused", http.StatusForbidden)
++			return
++		}
++		requested = true
++		cmd := &events.CommentCommand{Name: command.Apply, ProjectName: request.project, RepoRelDir: request.dir, Workspace: request.workspace, ExpectedHeadCommit: request.head, ExpectedPlanHash: request.plan}
++		a.Logger.Info("authenticated web apply requested by %s as %s for %s#%d project %s", r.Header.Get(a.UserHeader), request.actor, request.repo.FullName, request.pull, request.project)
++		go a.CommandRunner.RunCommentCommand(request.repo, nil, nil, models.User{Username: request.actor}, request.pull, cmd)
++	}
++	w.Header().Set("Content-Type", "text/html; charset=utf-8")
++	if err := a.Template.Execute(w, web_templates.ApplyConfirmationData{RepoFullName: request.repo.FullName, PullNum: request.pull, ProjectName: request.project, RepoRelDir: request.dir, Workspace: request.workspace, HeadCommit: request.head, PlanHash: request.plan, Actor: request.actor, Requested: requested, CleanedBasePath: a.AtlantisURL.Path}); err != nil {
++		a.Logger.Err("rendering apply confirmation: %s", err)
++	}
++}
+diff --git a/server/controllers/apply_controller_test.go b/server/controllers/apply_controller_test.go
+new file mode 100644
+index 0000000..54a20e5
+--- /dev/null
++++ b/server/controllers/apply_controller_test.go
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Atlantis Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package controllers_test
++
++import (
++	"html/template"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"net/url"
++	"testing"
++	"time"
++
++	"github.com/runatlantis/atlantis/server/controllers"
++	"github.com/runatlantis/atlantis/server/events"
++	"github.com/runatlantis/atlantis/server/events/models"
++	"github.com/runatlantis/atlantis/server/logging"
++)
++
++type capturedApply struct {
++	user models.User
++	cmd  *events.CommentCommand
++}
++
++type capturingCommandRunner struct{ calls chan capturedApply }
++
++func (c *capturingCommandRunner) RunCommentCommand(_ models.Repo, _ *models.Repo, _ *models.PullRequest, user models.User, _ int, cmd *events.CommentCommand) {
++	c.calls <- capturedApply{user: user, cmd: cmd}
++}
++
++func (*capturingCommandRunner) RunAutoplanCommand(models.Repo, models.Repo, models.PullRequest, models.User) {
++}
++
++func newApplyController(t *testing.T) (*controllers.ApplyController, *capturingCommandRunner) {
++	t.Helper()
++	allowlist, err := events.NewRepoAllowlistChecker("github.com/alxleo/homelab")
++	if err != nil {
++		t.Fatal(err)
++	}
++	runner := &capturingCommandRunner{calls: make(chan capturedApply, 1)}
++	return &controllers.ApplyController{
++		AtlantisURL:          &url.URL{Scheme: "https", Host: "atlantis.example"},
++		Logger:               logging.NewNoopLogger(t),
++		CommandRunner:        runner,
++		RepoAllowlistChecker: allowlist,
++		GithubHostname:       "github.com",
++		UserHeader:           "Remote-User",
++		TrustedProxy:         netip.MustParseAddr("192.0.2.10"),
++		UserMap:              map[string]string{"alex": "alxleo"},
++		Template:             template.Must(template.New("test").Parse("{{ .Actor }} {{ .Requested }}")),
++	}, runner
++}
++
++func applyURL() string {
++	return "https://atlantis.example/apply?repo=alxleo%2Fhomelab&pull=42&project=network&dir=infrastructure%2Fterraform%2Fnetwork&workspace=default&head=1111111111111111111111111111111111111111&plan=2222222222222222222222222222222222222222222222222222222222222222"
++}
++
++func TestApplyControllerConfirmsExactPlanAsMappedUser(t *testing.T) {
++	controller, runner := newApplyController(t)
++	req := httptest.NewRequest(http.MethodPost, applyURL(), nil)
++	req.RemoteAddr = "192.0.2.10:12345"
++	req.Header.Set("Remote-User", "alex")
++	req.Header.Set("Origin", "https://atlantis.example")
++	w := httptest.NewRecorder()
++
++	controller.Apply(w, req)
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
++	}
++	select {
++	case got := <-runner.calls:
++		if got.user.Username != "alxleo" || got.cmd.ProjectName != "network" || got.cmd.ExpectedHeadCommit != "1111111111111111111111111111111111111111" || got.cmd.ExpectedPlanHash != "2222222222222222222222222222222222222222222222222222222222222222" {
++			t.Fatalf("unexpected apply: %#v", got)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("apply command was not dispatched")
++	}
++}
++
++func TestApplyControllerRefusesUntrustedProxyAndCrossOrigin(t *testing.T) {
++	controller, _ := newApplyController(t)
++	for name, request := range map[string][2]string{
++		"untrusted proxy": {"192.0.2.11:12345", "https://atlantis.example"},
++		"cross origin":    {"192.0.2.10:12345", "https://attacker.example"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			req := httptest.NewRequest(http.MethodPost, applyURL(), nil)
++			req.RemoteAddr = request[0]
++			req.Header.Set("Remote-User", "alex")
++			req.Header.Set("Origin", request[1])
++			w := httptest.NewRecorder()
++			controller.Apply(w, req)
++			if w.Code != http.StatusForbidden {
++				t.Fatalf("status = %d, want 403", w.Code)
++			}
++		})
++	}
++}
+diff --git a/server/controllers/web_templates/templates/apply-confirmation.html.tmpl b/server/controllers/web_templates/templates/apply-confirmation.html.tmpl
+new file mode 100644
+index 0000000..e292131
+--- /dev/null
++++ b/server/controllers/web_templates/templates/apply-confirmation.html.tmpl
+@@ -0,0 +1,36 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>Confirm Atlantis apply</title>
++  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
++  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
++  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
++</head>
++<body>
++  <main class="container" style="max-width: 760px; padding-top: 5rem">
++    {{ if .Requested }}
++    <h3>Apply requested</h3>
++    <p>Atlantis is checking the saved plan and the pull request requirements as <code>{{ .Actor }}</code>. The result will appear on the pull request.</p>
++    {{ else }}
++    <h3>Confirm saved plan</h3>
++    <table class="u-full-width">
++      <tbody>
++        <tr><th>Repository</th><td><code>{{ .RepoFullName }}</code></td></tr>
++        <tr><th>Pull request</th><td>#{{ .PullNum }}</td></tr>
++        <tr><th>Project</th><td><code>{{ if .ProjectName }}{{ .ProjectName }}{{ else }}{{ .RepoRelDir }}{{ end }}</code></td></tr>
++        <tr><th>Workspace</th><td><code>{{ .Workspace }}</code></td></tr>
++        <tr><th>Head</th><td><code>{{ slice .HeadCommit 0 12 }}</code></td></tr>
++        <tr><th>Plan</th><td><code>{{ slice .PlanHash 0 12 }}</code></td></tr>
++        <tr><th>Actor</th><td><code>{{ .Actor }}</code></td></tr>
++      </tbody>
++    </table>
++    <p>Atlantis will use the normal apply path. A changed head or plan, failed policy, missing approval, merge conflict, or divergence is refused.</p>
++    <form method="post">
++      <button class="button-primary" type="submit">Confirm &amp; apply</button>
++    </form>
++    {{ end }}
++  </main>
++</body>
++</html>
+diff --git a/server/controllers/web_templates/web_templates.go b/server/controllers/web_templates/web_templates.go
+index cae1f24..5743018 100644
+--- a/server/controllers/web_templates/web_templates.go
++++ b/server/controllers/web_templates/web_templates.go
+@@ -28,6 +28,7 @@ var templateFileNames = map[string]string{
+ 	"project-jobs":       "project-jobs.html.tmpl",
+ 	"project-jobs-error": "project-jobs-error.html.tmpl",
+ 	"github-app":         "github-app.html.tmpl",
++	"apply-confirmation": "apply-confirmation.html.tmpl",
+ }
+ 
+ // TemplateWriter is an interface over html/template that's used to enable
+@@ -108,6 +109,21 @@ type ProjectJobsError struct {
+ 
+ var ProjectJobsErrorTemplate = templates.Lookup(templateFileNames["project-jobs-error"])
+ 
++type ApplyConfirmationData struct {
++	RepoFullName    string
++	PullNum         int
++	ProjectName     string
++	RepoRelDir      string
++	Workspace       string
++	HeadCommit      string
++	PlanHash        string
++	Actor           string
++	Requested       bool
++	CleanedBasePath string
++}
++
++var ApplyConfirmationTemplate = templates.Lookup(templateFileNames["apply-confirmation"])
++
+ // GithubSetupData holds the data for rendering the github app setup page
+ type GithubSetupData struct {
+ 	Target          string
+diff --git a/server/events/command_runner.go b/server/events/command_runner.go
+index 67a089e..898fc51 100644
+--- a/server/events/command_runner.go
++++ b/server/events/command_runner.go
+@@ -489,12 +489,20 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
+ 	if err != nil {
+ 		return
+ 	}
++	if cmd.ExpectedHeadCommit != "" && pull.HeadCommit != cmd.ExpectedHeadCommit {
++		_ = c.VCSClient.CreateComment(log, baseRepo, pullNum, "The confirmed Atlantis plan is no longer current. Open the latest plan and confirm it again.", command.Apply.String())
++		return
++	}
+ 
+ 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
+ 
+ 	if err != nil {
+ 		log.Err("Unable to fetch pull status, this is likely a bug: %s", err)
+ 	}
++	if cmd.ExpectedPlanHash != "" && !pullStatusHasExpectedPlan(status, cmd, cmd.ExpectedPlanHash) {
++		_ = c.VCSClient.CreateComment(log, baseRepo, pullNum, "The confirmed Atlantis plan has been replaced or is no longer applyable. Open the latest plan and confirm it again.", command.Apply.String())
++		return
++	}
+ 
+ 	ctx := &command.Context{
+ 		User:                 user,
+@@ -571,6 +579,18 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
+ 	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
+ }
+ 
++func pullStatusHasExpectedPlan(status *models.PullStatus, cmd *CommentCommand, expected string) bool {
++	if status == nil {
++		return false
++	}
++	for _, project := range status.Projects {
++		if project.ProjectName == cmd.ProjectName && project.RepoRelDir == cmd.RepoRelDir && project.Workspace == cmd.Workspace {
++			return project.PlanHash == expected
++		}
++	}
++	return false
++}
++
+ func (c *DefaultCommandRunner) getGithubData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, models.Repo, error) {
+ 	if c.GithubPullGetter == nil {
+ 		return models.PullRequest{}, models.Repo{}, errors.New("atlantis not configured to support GitHub")
+diff --git a/server/events/event_parser.go b/server/events/event_parser.go
+index 14bb446..61608fb 100644
+--- a/server/events/event_parser.go
++++ b/server/events/event_parser.go
+@@ -138,6 +138,10 @@ type CommentCommand struct {
+ 	PolicySet string
+ 	// ClearPolicyApproval is true if approvals should be cleared out for specified policies.
+ 	ClearPolicyApproval bool
++	// ExpectedHeadCommit and ExpectedPlanHash bind a web confirmation to the
++	// source revision and saved plan displayed on that page.
++	ExpectedHeadCommit string
++	ExpectedPlanHash   string
+ }
+ 
+ // IsForSpecificProject returns true if the command is for a specific dir, workspace
+diff --git a/server/events/markdown_renderer.go b/server/events/markdown_renderer.go
+index cfe2b9f..666db02 100644
+--- a/server/events/markdown_renderer.go
++++ b/server/events/markdown_renderer.go
+@@ -137,6 +137,8 @@ type projectResultTmplData struct {
+ 	Rendered     string
+ 	NoChanges    bool
+ 	IsSuccessful bool
++	RenderFailure   bool
++	FailureProjects []string
+ }
+ 
+ // Initialize templates
+@@ -257,6 +259,7 @@ func (m *MarkdownRenderer) renderProjectResults(ctx *command.Context, results []
+ 			RepoRelDir:   result.RepoRelDir,
+ 			ProjectName:  result.ProjectName,
+ 			IsSuccessful: result.IsSuccessful(),
++			RenderFailure: true,
+ 		}
+ 		if result.PlanSuccess != nil {
+ 			result.PlanSuccess.TerraformOutput = strings.TrimSpace(result.PlanSuccess.TerraformOutput)
+@@ -368,6 +371,26 @@ func (m *MarkdownRenderer) renderProjectResults(ctx *command.Context, results []
+ 		}
+ 		resultsTmplData = append(resultsTmplData, resultData)
+ 	}
++	groupedFailures := map[string]int{}
++	for i := range resultsTmplData {
++		if resultsTmplData[i].IsSuccessful {
++			continue
++		}
++		label := resultsTmplData[i].ProjectName
++		if label == "" {
++			label = resultsTmplData[i].RepoRelDir
++		}
++		if workspace := resultsTmplData[i].Workspace; workspace != "" && workspace != "default" {
++			label += " (" + workspace + ")"
++		}
++		if first, ok := groupedFailures[resultsTmplData[i].Rendered]; ok {
++			resultsTmplData[first].FailureProjects = append(resultsTmplData[first].FailureProjects, label)
++			resultsTmplData[i].RenderFailure = false
++			continue
++		}
++		groupedFailures[resultsTmplData[i].Rendered] = i
++		resultsTmplData[i].FailureProjects = []string{label}
++	}
+ 
+ 	var tmpl *template.Template
+ 	switch {
+diff --git a/server/events/models/models.go b/server/events/models/models.go
+index fbaa9e6..0df8f6d 100644
+--- a/server/events/models/models.go
++++ b/server/events/models/models.go
+@@ -466,6 +466,36 @@ type PlanSuccess struct {
+ 	// empty when the plan stage is built only from custom run steps, which
+ 	// manage their own plan file.
+ 	PlanHash string
++	// PlanRiskSummary is a value-free summary produced from the saved plan JSON.
++	PlanRiskSummary PlanRiskSummary
++	// JobURL opens the live output for this exact plan run.
++	JobURL string
++	// ApplyURL opens the authenticated confirmation page for this exact saved plan.
++	ApplyURL string
++	// HeadCommit and CommitURL identify the source revision that produced the plan.
++	HeadCommit string
++	CommitURL  string
++}
++
++// PlanRiskSummary contains no before/after values and is safe to show in a PR comment.
++type PlanRiskSummary struct {
++	Counts        PlanActionCounts   `json:"counts"`
++	Risky         PlanRiskyAddresses `json:"risky"`
++	ResourceTypes map[string]int     `json:"resource_types"`
++}
++
++type PlanActionCounts struct {
++	Add     int `json:"add"`
++	Update  int `json:"update"`
++	Replace int `json:"replace"`
++	Destroy int `json:"destroy"`
++	Forget  int `json:"forget"`
++}
++
++type PlanRiskyAddresses struct {
++	Replace []string `json:"replace"`
++	Destroy []string `json:"destroy"`
++	Forget  []string `json:"forget"`
+ }
+ 
+ func NewPolicySetResult(policySetName string, policyOutput string, passed bool, reqApprovalCount int, policyItemRegex string) (*PolicySetResult, error) {
+diff --git a/server/events/project_command_runner.go b/server/events/project_command_runner.go
+index b0aeb0e..c271031 100644
+--- a/server/events/project_command_runner.go
++++ b/server/events/project_command_runner.go
+@@ -899,7 +899,7 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
+ 		return nil, "", errorWithStepOutput(err, outputs)
+ 	}
+ 
+-	planHash, err := planStagePlanHash(ctx, projAbsPath)
++	planHash, planRiskSummary, err := planStageMetadata(ctx, projAbsPath)
+ 	if err != nil {
+ 		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+ 			ctx.Log.Err("error unlocking state after plan error: %v", unlockErr)
+@@ -907,6 +907,20 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
+ 		return nil, "", errorWithStepOutput(err, outputs)
+ 	}
+ 
++	jobURL := ""
++	applyURL := ""
++	if p.ProjectJobURLGenerator != nil {
++		jobURL, _ = p.ProjectJobURLGenerator.GenerateProjectJobURL(ctx)
++		if generator, ok := p.ProjectJobURLGenerator.(interface {
++			GenerateApplyURL(command.ProjectContext, string) (string, error)
++		}); ok && planHash != "" {
++			applyURL, _ = generator.GenerateApplyURL(ctx, planHash)
++		}
++	}
++	commitURL := ""
++	if ctx.BaseRepo.VCSHost.Type == models.Github && ctx.Pull.HeadCommit != "" {
++		commitURL = fmt.Sprintf("https://%s/%s/commit/%s", ctx.BaseRepo.VCSHost.Hostname, ctx.BaseRepo.FullName, ctx.Pull.HeadCommit)
++	}
+ 	return &models.PlanSuccess{
+ 		LockURL:         p.LockURLGenerator.GenerateLockURL(lockAttempt.LockKey),
+ 		TerraformOutput: strings.Join(outputs, "\n"),
+@@ -914,30 +928,47 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
+ 		ApplyCmd:        ctx.ApplyCmd,
+ 		MergedAgain:     mergedAgain,
+ 		PlanHash:        planHash,
++		PlanRiskSummary: planRiskSummary,
++		JobURL:          jobURL,
++		ApplyURL:        applyURL,
++		HeadCommit:      ctx.Pull.HeadCommit,
++		CommitURL:       commitURL,
+ 	}, "", nil
+ }
+ 
+-// planStagePlanHash hashes the convention plan file the built-in plan step
+-// wrote so that apply can verify the file it is handed is the one produced
+-// here. The hash is recorded with the project's plan status. A plan stage
+-// without a built-in plan step manages its own plan file, so there is nothing
+-// for Atlantis to bind and the hash is empty.
+-func planStagePlanHash(ctx command.ProjectContext, absPath string) (string, error) {
++// planStageMetadata reads the hash and the value-free JSON summary written beside
++// an Atlantis-managed plan. Custom plan steps continue to own their artifacts.
++func planStageMetadata(ctx command.ProjectContext, absPath string) (string, models.PlanRiskSummary, error) {
+ 	if !hasAtlantisManagedPlanStep(ctx.Steps) {
+-		return "", nil
++		return "", models.PlanRiskSummary{}, nil
+ 	}
+ 	planPath, err := safePlanFilePath(ctx, absPath)
+ 	if err != nil {
+-		return "", err
++		return "", models.PlanRiskSummary{}, err
+ 	}
+ 	planHash, err := hashFile(runtime.GetPlanFileDir(ctx, absPath), planPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+-			return "", fmt.Errorf("plan step did not write a plan file for dir %q workspace %q project %q", ctx.RepoRelDir, ctx.Workspace, ctx.ProjectName)
++			return "", models.PlanRiskSummary{}, fmt.Errorf("plan step did not write a plan file for dir %q workspace %q project %q", ctx.RepoRelDir, ctx.Workspace, ctx.ProjectName)
+ 		}
+-		return "", fmt.Errorf("hashing plan file for dir %q workspace %q project %q: %w", ctx.RepoRelDir, ctx.Workspace, ctx.ProjectName, err)
++		return "", models.PlanRiskSummary{}, fmt.Errorf("hashing plan file for dir %q workspace %q project %q: %w", ctx.RepoRelDir, ctx.Workspace, ctx.ProjectName, err)
++	}
++	summaryPath := planPath + ".summary.json"
++	if _, err := containedPlanRelPath(runtime.GetPlanFileDir(ctx, absPath), summaryPath); err != nil {
++		return "", models.PlanRiskSummary{}, err
++	}
++	contents, err := os.ReadFile(summaryPath)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return planHash, models.PlanRiskSummary{}, nil
++		}
++		return "", models.PlanRiskSummary{}, fmt.Errorf("reading plan summary for dir %q workspace %q project %q: %w", ctx.RepoRelDir, ctx.Workspace, ctx.ProjectName, err)
++	}
++	var summary models.PlanRiskSummary
++	if err := json.Unmarshal(contents, &summary); err != nil {
++		return "", models.PlanRiskSummary{}, fmt.Errorf("decoding plan summary for dir %q workspace %q project %q: %w", ctx.RepoRelDir, ctx.Workspace, ctx.ProjectName, err)
+ 	}
+-	return planHash, nil
++	return planHash, summary, nil
+ }
+ 
+ func (p *DefaultProjectCommandRunner) doApply(ctx command.ProjectContext) (applyOut string, applyURL string, failure string, err error) {
+diff --git a/server/router.go b/server/router.go
+index b23eac3..8449770 100644
+--- a/server/router.go
++++ b/server/router.go
+@@ -6,6 +6,7 @@ package server
+ import (
+ 	"fmt"
+ 	"net/url"
++	"strconv"
+ 
+ 	"github.com/gorilla/mux"
+ 	"github.com/runatlantis/atlantis/server/events/command"
+@@ -22,6 +23,7 @@ type Router struct {
+ 	LockViewRouteName string
+ 	// ProjectJobsViewRouteName is the named route for the projects active jobs
+ 	ProjectJobsViewRouteName string
++	ApplyViewRouteName       string
+ 	// LockViewRouteIDQueryParam is the query parameter needed to construct the
+ 	// lock view: underlying.Get(LockViewRouteName).URL(LockViewRouteIDQueryParam, "my id").
+ 	LockViewRouteIDQueryParam string
+@@ -30,6 +32,23 @@ type Router struct {
+ 	AtlantisURL *url.URL
+ }
+ 
++func (r *Router) GenerateApplyURL(ctx command.ProjectContext, planHash string) (string, error) {
++	applyURL, err := r.Underlying.Get(r.ApplyViewRouteName).URL()
++	if err != nil {
++		return "", fmt.Errorf("creating apply url: %w", err)
++	}
++	query := applyURL.Query()
++	query.Set("repo", ctx.BaseRepo.FullName)
++	query.Set("pull", strconv.Itoa(ctx.Pull.Num))
++	query.Set("project", ctx.ProjectName)
++	query.Set("dir", ctx.RepoRelDir)
++	query.Set("workspace", ctx.Workspace)
++	query.Set("head", ctx.Pull.HeadCommit)
++	query.Set("plan", planHash)
++	applyURL.RawQuery = query.Encode()
++	return r.AtlantisURL.String() + applyURL.String(), nil
++}
++
+ // GenerateLockURL returns a fully qualified URL to view the lock at lockID.
+ func (r *Router) GenerateLockURL(lockID string) string {
+ 	lockURL, _ := r.Underlying.Get(r.LockViewRouteName).URL(r.LockViewRouteIDQueryParam, url.QueryEscape(lockID))
+diff --git a/server/server.go b/server/server.go
+index 7a4081e..bce9793 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -17,6 +17,7 @@ import (
+ 	"log"
+ 	"net/http"
+ 	"net/http/pprof"
++	"net/netip"
+ 	"net/url"
+ 	"os"
+ 	"os/signal"
+@@ -81,6 +82,7 @@ const (
+ 	LockViewRouteIDQueryParam = "id"
+ 	// ProjectJobsViewRouteName is the named route in mux.Router for the log stream view.
+ 	ProjectJobsViewRouteName = "project-jobs-detail"
++	ApplyViewRouteName       = "apply-confirmation"
+ 	// binDirName is the name of the directory inside our data dir where
+ 	// we download binaries.
+ 	BinDirName = "bin"
+@@ -109,6 +111,7 @@ type Server struct {
+ 	LocksController                *controllers.LocksController
+ 	StatusController               *controllers.StatusController
+ 	JobsController                 *controllers.JobsController
++	ApplyController                *controllers.ApplyController
+ 	APIController                  *controllers.APIController
+ 	IndexTemplate                  web_templates.TemplateWriter
+ 	LockDetailTemplate             web_templates.TemplateWriter
+@@ -436,6 +439,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
+ 		LockViewRouteIDQueryParam: LockViewRouteIDQueryParam,
+ 		LockViewRouteName:         LockViewRouteName,
+ 		ProjectJobsViewRouteName:  ProjectJobsViewRouteName,
++		ApplyViewRouteName:        ApplyViewRouteName,
+ 		Underlying:                underlyingRouter,
+ 	}
+ 
+@@ -1048,6 +1052,27 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	var applyController *controllers.ApplyController
++	webUIConfigured := userConfig.WebUITrustedProxy != "" || userConfig.WebUIUserHeader != "" || userConfig.WebUIUserMap != ""
++	if webUIConfigured {
++		if userConfig.WebUITrustedProxy == "" || userConfig.WebUIUserHeader == "" || userConfig.WebUIUserMap == "" {
++			return nil, errors.New("web UI apply requires web-ui-trusted-proxy, web-ui-user-header, and web-ui-user-map together")
++		}
++		trustedProxy, parseErr := netip.ParseAddr(userConfig.WebUITrustedProxy)
++		if parseErr != nil {
++			return nil, fmt.Errorf("parsing web UI trusted proxy: %w", parseErr)
++		}
++		userMap, parseErr := controllers.ParseWebUIUserMap(userConfig.WebUIUserMap)
++		if parseErr != nil {
++			return nil, parseErr
++		}
++		applyController = &controllers.ApplyController{
++			AtlantisURL: parsedURL, Logger: logger, CommandRunner: commandRunner,
++			RepoAllowlistChecker: repoAllowlist, GithubHostname: userConfig.GithubHostname,
++			UserHeader: userConfig.WebUIUserHeader, TrustedProxy: trustedProxy, UserMap: userMap,
++			Template: web_templates.ApplyConfirmationTemplate,
++		}
++	}
+ 	locksController := &controllers.LocksController{
+ 		AtlantisVersion:    config.AtlantisVersion,
+ 		AtlantisURL:        parsedURL,
+@@ -1171,6 +1196,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
+ 		GithubAppController:            githubAppController,
+ 		LocksController:                locksController,
+ 		JobsController:                 jobsController,
++		ApplyController:                applyController,
+ 		StatusController:               statusController,
+ 		APIController:                  apiController,
+ 		IndexTemplate:                  web_templates.IndexTemplate,
+@@ -1231,6 +1257,9 @@ func (s *Server) SetupRoutes() {
+ 		Queries(LockViewRouteIDQueryParam, fmt.Sprintf("{%s}", LockViewRouteIDQueryParam)).Name(LockViewRouteName)
+ 	s.Router.HandleFunc("/jobs/{job-id}", s.JobsController.GetProjectJobs).Methods("GET").Name(ProjectJobsViewRouteName)
+ 	s.Router.HandleFunc("/jobs/{job-id}/ws", s.JobsController.GetProjectJobsWS).Methods("GET")
++	if s.ApplyController != nil {
++		s.Router.HandleFunc("/apply", s.ApplyController.Apply).Methods("GET", "POST").Name(ApplyViewRouteName)
++	}
+ 
+ 	r, ok := s.StatsReporter.(prometheus.Reporter)
+ 	if ok {
+diff --git a/server/user_config.go b/server/user_config.go
+index 1afde63..e6183df 100644
+--- a/server/user_config.go
++++ b/server/user_config.go
+@@ -145,6 +145,9 @@ type UserConfig struct {
+ 	WebBasicAuth               bool            `mapstructure:"web-basic-auth"`
+ 	WebUsername                string          `mapstructure:"web-username"`
+ 	WebPassword                string          `mapstructure:"web-password"`
++	WebUITrustedProxy          string          `mapstructure:"web-ui-trusted-proxy"`
++	WebUIUserHeader            string          `mapstructure:"web-ui-user-header"`
++	WebUIUserMap               string          `mapstructure:"web-ui-user-map"`
+ 	WriteGitCreds              bool            `mapstructure:"write-git-creds"`
+ 	WebsocketCheckOrigin       bool            `mapstructure:"websocket-check-origin"`
+ 	UseTFPluginCache           bool            `mapstructure:"use-tf-plugin-cache"`
