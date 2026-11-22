@@ -33,6 +33,7 @@
 
       packages.x86_64-linux = {
         atlantis = pkgs.callPackage ./pkgs/atlantis { };
+        coreos-installer = nixpkgs-stable.legacyPackages.x86_64-linux.callPackage ./pkgs/coreos-installer.nix { };
         gitea = pkgs.callPackage ./pkgs/gitea { };
         comin = cominFor "x86_64-linux";
         system-manager = systemManagerFor "x86_64-linux";
