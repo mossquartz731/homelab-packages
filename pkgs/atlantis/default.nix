@@ -12,7 +12,7 @@ atlantis.overrideAttrs (old: rec {
     tag = "v${version}";
     hash = "sha256-/NhnJ4a4uB9JaYmAtAk2ckWNVCw/Ntgh55KGyR48+og=";
   };
-  vendorHash = "sha256-Ym1IKn16yUxSdvEhXM4MVZgQsQA1k96OvzsFmeO7BFo=";
+  vendorHash = "sha256-vK/Ef+ihYwDimSPBlMwBiFS/hfQYhERhXtLAx06Al/I=";
   # v0.50.0 still loses completed plan state across policy DB writes. The
   # run-review patch adds value-free summaries and a proxy-authenticated exact-plan action.
   patches = (old.patches or [ ]) ++ [ ./atlantis-policy-status.patch ./atlantis-run-review.patch ];
