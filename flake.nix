@@ -18,6 +18,10 @@
   outputs = { self, nixpkgs, nixpkgs-stable, comin, system-manager }:
     let
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      netdataPkgs = import nixpkgs-stable {
+        system = "x86_64-linux";
+        config.allowUnfreePredicate = package: nixpkgs-stable.lib.getName package == "netdata";
+      };
       cominFor = system: import ./pkgs/comin comin.packages.${system}.default;
       # Official release binaries, downloaded rather than built.
       giteaRunnerFor = system: nixpkgs-stable.legacyPackages.${system}.callPackage ./pkgs/gitea-runner { };
@@ -39,6 +43,7 @@
         system-manager = systemManagerFor "x86_64-linux";
         gitea-runner = giteaRunnerFor "x86_64-linux";
         openbao-plugin-secrets-github = openbaoPluginFor "x86_64-linux";
+        netdata = netdataPkgs.netdataCloud;
       };
       packages.aarch64-linux = {
         comin = cominFor "aarch64-linux";
@@ -48,6 +53,17 @@
 
       # gitea.com refuses GitHub-hosted runners, so the Gitea runner's download
       # is only evaluated here; homelab's machines fetch it.
-      checks = builtins.mapAttrs (_: packages: removeAttrs packages [ "gitea-runner" ]) self.packages;
+      checks = builtins.mapAttrs (
+        system: packages:
+        removeAttrs packages [ "gitea-runner" ]
+        // nixpkgs-stable.lib.optionalAttrs (system == "x86_64-linux") {
+          netdata-license = netdataPkgs.runCommand "netdata-dashboard-license" { } ''
+            dashboard=${packages.netdata}/share/netdata/web/v3
+            grep -Fq 'Netdata Cloud UI License v1.0 (NCUL1)' "$dashboard/LICENSE.md"
+            test -s "$dashboard/3D_PARTY_LICENSES.txt"
+            touch "$out"
+          '';
+        }
+      ) self.packages;
     };
 }
