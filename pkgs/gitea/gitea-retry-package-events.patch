@@ -79,22 +79,24 @@ index a192c5b..dea8da8 100644
 @@ -33,0 +35 @@ func loadWebhookFrom(rootCfg ConfigProvider) {
 +	Webhook.RetryPackageDeliveries = sec.Key("RETRY_PACKAGE_DELIVERIES").MustBool(false)
 diff --git a/services/webhook/deliver.go b/services/webhook/deliver.go
-index 83387c2..f9ad8a1 100644
+index 83387c2..eed2dc9 100644
 --- a/services/webhook/deliver.go
 +++ b/services/webhook/deliver.go
-@@ -147,0 +148,4 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
+@@ -18,0 +19 @@ import (
++	"sync"
+@@ -147,0 +149,4 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
 +	return deliver(ctx, t, false)
 +}
 +
 +func deliver(ctx context.Context, t *webhook_model.HookTask, retry bool) error {
-@@ -162,0 +167,6 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
+@@ -162,0 +168,6 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
 +	if retry {
 +		claimed, err := webhook_model.MarkPackageHookRetried(ctx, t)
 +		if err != nil || !claimed {
 +			return err
 +		}
 +	}
-@@ -201,9 +211,11 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
+@@ -201,9 +212,11 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
 -	updated, err := webhook_model.MarkTaskDelivered(ctx, t)
 -	if err != nil {
 -		log.Error("MarkTaskDelivered[%d]: %v", t.ID, err)
@@ -115,18 +117,17 @@ index 83387c2..f9ad8a1 100644
 +			log.Trace("Webhook Task[%d] already delivered", t.ID)
 +			return nil
 +		}
-@@ -218,0 +231,2 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
+@@ -218,0 +232,2 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
 +		} else if setting.Webhook.RetryPackageDeliveries && t.EventType == webhook_module.HookEventPackage {
 +			log.Error("Package webhook task[%d] pending retry", t.ID)
-@@ -287 +301,6 @@ func Init() error {
+@@ -287 +302,4 @@ func Init() error {
 -	go graceful.GetManager().RunWithShutdownContext(populateWebhookSendingQueue)
++	retryPackages := setting.Webhook.RetryPackageDeliveries
 +	go graceful.GetManager().RunWithShutdownContext(func(ctx context.Context) {
-+		populateWebhookSendingQueue(ctx)
-+		if setting.Webhook.RetryPackageDeliveries {
-+			retryPackageWebhooks(ctx, packageRetrySpacing)
-+		}
++		recoverWebhookDeliveries(ctx, enqueueHookTask, retryPackages, packageRetrySpacing)
 +	})
-@@ -291,0 +311,34 @@ func Init() error {
+@@ -292 +310,44 @@ func Init() error {
+-func populateWebhookSendingQueue(ctx context.Context) {
 +const (
 +	packageRetryBackoff = time.Minute
 +	packageRetrySpacing = 5 * time.Second
@@ -161,20 +162,34 @@ index 83387c2..f9ad8a1 100644
 +	}
 +}
 +
++func recoverWebhookDeliveries(ctx context.Context, enqueue func(int64) error, retryPackages bool, spacing time.Duration) {
++	var workers sync.WaitGroup
++	if retryPackages {
++		workers.Go(func() { retryPackageWebhooks(ctx, spacing) })
++	}
++	populateWebhookSendingQueue(ctx, enqueue)
++	workers.Wait()
++}
++
++func populateWebhookSendingQueue(ctx context.Context, enqueue func(int64) error) {
+@@ -315 +376 @@ func populateWebhookSendingQueue(ctx context.Context) {
+-			if err := enqueueHookTask(taskID); err != nil {
++			if err := enqueue(taskID); err != nil {
 diff --git a/services/webhook/deliver_test.go b/services/webhook/deliver_test.go
-index cf954bb..24be4e0 100644
+index cf954bb..508f351 100644
 --- a/services/webhook/deliver_test.go
 +++ b/services/webhook/deliver_test.go
 @@ -6,0 +7 @@ import (
 +	"context"
 @@ -10,0 +12 @@ import (
 +	"sync/atomic"
-@@ -15,0 +18,2 @@ import (
+@@ -15,0 +18,3 @@ import (
++	"gitea.dev/modules/queue"
 +	"gitea.dev/modules/setting"
 +	"gitea.dev/modules/timeutil"
-@@ -19,0 +24 @@ import (
+@@ -19,0 +25 @@ import (
 +	"github.com/stretchr/testify/require"
-@@ -21,0 +27,102 @@ import (
+@@ -21,0 +28,123 @@ import (
 +func TestPackageWebhookRetriesArePacedAndRetained(t *testing.T) {
 +	require.NoError(t, unittest.PrepareTestDatabase())
 +	oldSetting := setting.Webhook.RetryPackageDeliveries
@@ -247,22 +262,43 @@ index cf954bb..24be4e0 100644
 +	require.EqualValues(t, 5, received.Load(), "the retained earlier delivery recovers")
 +
 +	healthy.Store(false)
-+	makeDue(publish().ID, 3*packageRetryBackoff)
-+	makeDue(publish().ID, 2*packageRetryBackoff)
++	for _, age := range []time.Duration{3 * packageRetryBackoff, 2 * packageRetryBackoff} {
++		retained := makeDue(publish().ID, age)
++		retained.IsDelivered = false // The old requeue path cleared this flag.
++		require.NoError(t, webhook_model.UpdateHookTask(ctx, retained))
++	}
 +	for range 7 {
 +		<-requests
 +	}
 +	retryCtx, cancel := context.WithCancel(ctx)
++	t.Cleanup(cancel)
++	fullQueue, err := queue.NewWorkerPoolQueueWithContext(retryCtx, "webhook-recovery-test",
++		setting.QueueSettings{Type: "channel", Length: 1, BatchLength: 1, MaxWorkers: 1}, handler, true)
++	require.NoError(t, err)
++	require.NoError(t, fullQueue.Push(int64(-1)))
++	populationStarted := make(chan struct{}, 1)
++	enqueue := func(id int64) error {
++		select {
++		case populationStarted <- struct{}{}:
++		default:
++		}
++		return fullQueue.Push(id)
++	}
 +	done := make(chan struct{})
 +	const spacing = 25 * time.Millisecond
 +	go func() {
 +		defer close(done)
-+		retryPackageWebhooks(retryCtx, spacing)
++		recoverWebhookDeliveries(retryCtx, enqueue, true, spacing)
 +	}()
 +	defer func() {
 +		cancel()
 +		<-done
 +	}()
++	select {
++	case <-populationStarted:
++	case <-time.After(time.Second):
++		t.Fatal("timed out waiting for the full generic queue to block recovery")
++	}
 +	var previous time.Time
 +	for range 2 {
 +		select {
