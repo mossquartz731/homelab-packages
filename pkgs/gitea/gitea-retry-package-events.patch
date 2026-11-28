@@ -1,9 +1,62 @@
+diff --git a/models/webhook/hooktask.go b/models/webhook/hooktask.go
+index 2c60e34..ec900ad 100644
+--- a/models/webhook/hooktask.go
++++ b/models/webhook/hooktask.go
+@@ -189 +189,2 @@ func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
+-	count, err := db.GetEngine(ctx).ID(task.ID).Where("is_delivered = ?", false).Cols("is_delivered").Update(&HookTask{
++	columns := []string{"is_delivered"}
++	update := &HookTask{
+@@ -192 +193,22 @@ func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
+-	})
++	}
++	if setting.Webhook.RetryPackageDeliveries && task.EventType == webhook_module.HookEventPackage {
++		columns = append(columns, "delivered")
++		update.Delivered = timeutil.TimeStampNanoNow()
++	}
++	count, err := db.GetEngine(ctx).ID(task.ID).Where("is_delivered = ?", false).Cols(columns...).Update(update)
++
++	return count != 0, err
++}
++
++func FindPendingPackageHookTask(ctx context.Context, before time.Time) (*HookTask, error) {
++	task := new(HookTask)
++	found, err := db.GetEngine(ctx).Table("hook_task").Select("hook_task.*").
++		Join("INNER", "webhook", "hook_task.hook_id = webhook.id").
++		Where("hook_task.event_type = ? AND hook_task.is_succeed = ? AND hook_task.delivered <= ? AND webhook.is_active = ?",
++			webhook_module.HookEventPackage, false, before.UnixNano(), true).
++		Asc("hook_task.delivered", "hook_task.id").Limit(1).Get(task)
++	if !found || err != nil {
++		return nil, err
++	}
++	return task, nil
++}
+@@ -193,0 +216,7 @@ func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
++func MarkPackageHookRetried(ctx context.Context, task *HookTask) (bool, error) {
++	count, err := db.GetEngine(ctx).ID(task.ID).
++		Where("is_succeed = ? AND delivered = ?", false, task.Delivered).
++		Cols("is_delivered", "delivered").Update(&HookTask{
++		IsDelivered: true,
++		Delivered:   timeutil.TimeStampNanoNow(),
++	})
+@@ -196,0 +226,7 @@ func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
++func completedHookTask() builder.Cond {
++	if setting.Webhook.RetryPackageDeliveries {
++		return builder.Or(builder.Neq{"hook_task.event_type": webhook_module.HookEventPackage}, builder.Eq{"hook_task.is_succeed": true})
++	}
++	return builder.NewCond()
++}
++
+@@ -205,0 +242 @@ func CleanupHookTaskTable(ctx context.Context, cleanupType HookTaskCleanupType,
++			And(completedHookTask()).
+@@ -240,0 +278 @@ func deleteDeliveredHookTasksByWebhook(ctx context.Context, hookID int64, number
++		And(completedHookTask()).
+@@ -252,0 +291 @@ func deleteDeliveredHookTasksByWebhook(ctx context.Context, hookID int64, number
++			And(completedHookTask()).
+diff --git a/modules/setting/webhook.go b/modules/setting/webhook.go
+index a192c5b..dea8da8 100644
 --- a/modules/setting/webhook.go
 +++ b/modules/setting/webhook.go
-@@ -11,15 +11,16 @@
- 
- // Webhook settings
- var Webhook = struct {
+@@ -14,9 +14,10 @@ var Webhook = struct {
 -	QueueLength     int
 -	DeliverTimeout  int
 -	SkipTLSVerify   bool
@@ -23,103 +76,256 @@
 +	ProxyURL               string
 +	ProxyURLFixed          *url.URL
 +	ProxyHosts             []string
- }{
- 	QueueLength:    1000,
- 	DeliverTimeout: 5,
-@@ -31,6 +32,7 @@
- 
- func loadWebhookFrom(rootCfg ConfigProvider) {
- 	sec := rootCfg.Section("webhook")
+@@ -33,0 +35 @@ func loadWebhookFrom(rootCfg ConfigProvider) {
 +	Webhook.RetryPackageDeliveries = sec.Key("RETRY_PACKAGE_DELIVERIES").MustBool(false)
- 	Webhook.QueueLength = sec.Key("QUEUE_LENGTH").MustInt(1000)
- 	Webhook.DeliverTimeout = sec.Key("DELIVER_TIMEOUT").MustInt(5)
- 	Webhook.SkipTLSVerify = sec.Key("SKIP_TLS_VERIFY").MustBool()
---- a/models/webhook/hooktask.go
-+++ b/models/webhook/hooktask.go
-@@ -174,11 +174,15 @@
- func FindUndeliveredHookTaskIDs(ctx context.Context, lowerID int64) ([]int64, error) {
- 	const batchSize = 100
- 
-+	pending := builder.Cond(builder.Eq{"is_delivered": false})
-+	if setting.Webhook.RetryPackageDeliveries {
-+		pending = builder.Or(pending, builder.Eq{"event_type": webhook_module.HookEventPackage, "is_succeed": false})
-+	}
- 	tasks := make([]int64, 0, batchSize)
- 	return tasks, db.GetEngine(ctx).
- 		Select("id").
- 		Table(new(HookTask)).
--		Where("is_delivered=?", false).
-+		Where(pending).
- 		And("id > ?", lowerID).
- 		Asc("id").
- 		Limit(batchSize).
---- a/services/webhook/webhook.go
-+++ b/services/webhook/webhook.go
-@@ -77,30 +77,56 @@
- // handle delivers hook tasks
- func handler(items ...int64) []int64 {
- 	ctx := graceful.GetManager().HammerContext()
--
-+	unhandled := make([]int64, 0)
- 	for _, taskID := range items {
- 		task, err := webhook_model.GetHookTaskByID(ctx, taskID)
- 		if err != nil {
--			if errors.Is(err, util.ErrNotExist) {
--				log.Warn("GetHookTaskByID[%d] warn: %v", taskID, err)
--			} else {
-+			if !errors.Is(err, util.ErrNotExist) {
- 				log.Error("GetHookTaskByID[%d] failed: %v", taskID, err)
-+				unhandled = append(unhandled, taskID)
- 			}
- 			continue
- 		}
--
-+		retry := setting.Webhook.RetryPackageDeliveries && task.EventType == webhook_module.HookEventPackage
-+		if retry {
-+			hook, err := webhook_model.GetWebhookByID(ctx, task.HookID)
-+			if err != nil {
-+				if !errors.Is(err, util.ErrNotExist) {
-+					unhandled = append(unhandled, taskID)
-+				}
-+				continue
-+			}
-+			if !hook.IsActive {
-+				continue
-+			}
-+		}
-+		if task.IsDelivered && retry && retryPackageTask(task) {
-+			task.IsDelivered = false
-+			if err := webhook_model.UpdateHookTask(ctx, task); err != nil {
-+				unhandled = append(unhandled, taskID)
-+				continue
-+			}
-+		}
- 		if task.IsDelivered {
--			// Already delivered in the meantime
--			log.Trace("Task[%d] has already been delivered", task.ID)
- 			continue
- 		}
--
- 		if err := Deliver(ctx, task); err != nil {
- 			log.Error("Unable to deliver webhook task[%d]: %v", task.ID, err)
- 		}
--	}
--
--	return nil
-+		if retry && retryPackageTask(task) {
-+			log.Error("Package webhook task[%d] pending retry", task.ID)
-+			task.IsDelivered = false
-+			if err := webhook_model.UpdateHookTask(ctx, task); err != nil {
-+				log.Error("Unable to retain package webhook task[%d]: %v", task.ID, err)
-+			}
-+			unhandled = append(unhandled, taskID)
-+		}
-+	}
-+	return unhandled
+diff --git a/services/webhook/deliver.go b/services/webhook/deliver.go
+index 83387c2..eed2dc9 100644
+--- a/services/webhook/deliver.go
++++ b/services/webhook/deliver.go
+@@ -18,0 +19 @@ import (
++	"sync"
+@@ -147,0 +149,4 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
++	return deliver(ctx, t, false)
 +}
 +
-+func retryPackageTask(task *webhook_model.HookTask) bool {
-+	return !task.IsSucceed
- }
- 
- func enqueueHookTask(taskID int64) error {
++func deliver(ctx context.Context, t *webhook_model.HookTask, retry bool) error {
+@@ -162,0 +168,6 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
++	if retry {
++		claimed, err := webhook_model.MarkPackageHookRetried(ctx, t)
++		if err != nil || !claimed {
++			return err
++		}
++	}
+@@ -201,9 +212,11 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
+-	updated, err := webhook_model.MarkTaskDelivered(ctx, t)
+-	if err != nil {
+-		log.Error("MarkTaskDelivered[%d]: %v", t.ID, err)
+-		return fmt.Errorf("unable to mark task[%d] delivered in the db: %w", t.ID, err)
+-	}
+-	if !updated {
+-		// This webhook task has already been attempted to be delivered or is in the process of being delivered
+-		log.Trace("Webhook Task[%d] already delivered", t.ID)
+-		return nil
++	if !retry {
++		updated, err := webhook_model.MarkTaskDelivered(ctx, t)
++		if err != nil {
++			log.Error("MarkTaskDelivered[%d]: %v", t.ID, err)
++			return fmt.Errorf("unable to mark task[%d] delivered in the db: %w", t.ID, err)
++		}
++		if !updated {
++			// This webhook task has already been attempted to be delivered or is in the process of being delivered
++			log.Trace("Webhook Task[%d] already delivered", t.ID)
++			return nil
++		}
+@@ -218,0 +232,2 @@ func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
++		} else if setting.Webhook.RetryPackageDeliveries && t.EventType == webhook_module.HookEventPackage {
++			log.Error("Package webhook task[%d] pending retry", t.ID)
+@@ -287 +302,4 @@ func Init() error {
+-	go graceful.GetManager().RunWithShutdownContext(populateWebhookSendingQueue)
++	retryPackages := setting.Webhook.RetryPackageDeliveries
++	go graceful.GetManager().RunWithShutdownContext(func(ctx context.Context) {
++		recoverWebhookDeliveries(ctx, enqueueHookTask, retryPackages, packageRetrySpacing)
++	})
+@@ -292 +310,44 @@ func Init() error {
+-func populateWebhookSendingQueue(ctx context.Context) {
++const (
++	packageRetryBackoff = time.Minute
++	packageRetrySpacing = 5 * time.Second
++)
++
++func retryPackageWebhooks(ctx context.Context, spacing time.Duration) {
++	timer := time.NewTimer(spacing)
++	defer timer.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-timer.C:
++		}
++		retryNextPackageWebhook(ctx)
++		timer.Reset(spacing)
++	}
++}
++
++func retryNextPackageWebhook(ctx context.Context) {
++	// The durable timestamp also covers a first attempt still in flight.
++	minAge := max(packageRetryBackoff, webhookHTTPClient.Timeout+packageRetrySpacing)
++	task, err := webhook_model.FindPendingPackageHookTask(ctx, time.Now().Add(-minAge))
++	if err != nil {
++		log.Error("Unable to find pending package webhook: %v", err)
++		return
++	}
++	if task != nil {
++		if err := deliver(ctx, task, true); err != nil {
++			log.Error("Unable to retry package webhook task[%d]: %v", task.ID, err)
++		}
++	}
++}
++
++func recoverWebhookDeliveries(ctx context.Context, enqueue func(int64) error, retryPackages bool, spacing time.Duration) {
++	var workers sync.WaitGroup
++	if retryPackages {
++		workers.Go(func() { retryPackageWebhooks(ctx, spacing) })
++	}
++	populateWebhookSendingQueue(ctx, enqueue)
++	workers.Wait()
++}
++
++func populateWebhookSendingQueue(ctx context.Context, enqueue func(int64) error) {
+@@ -315 +376 @@ func populateWebhookSendingQueue(ctx context.Context) {
+-			if err := enqueueHookTask(taskID); err != nil {
++			if err := enqueue(taskID); err != nil {
+diff --git a/services/webhook/deliver_test.go b/services/webhook/deliver_test.go
+index cf954bb..508f351 100644
+--- a/services/webhook/deliver_test.go
++++ b/services/webhook/deliver_test.go
+@@ -6,0 +7 @@ import (
++	"context"
+@@ -10,0 +12 @@ import (
++	"sync/atomic"
+@@ -15,0 +18,3 @@ import (
++	"gitea.dev/modules/queue"
++	"gitea.dev/modules/setting"
++	"gitea.dev/modules/timeutil"
+@@ -19,0 +25 @@ import (
++	"github.com/stretchr/testify/require"
+@@ -21,0 +28,123 @@ import (
++func TestPackageWebhookRetriesArePacedAndRetained(t *testing.T) {
++	require.NoError(t, unittest.PrepareTestDatabase())
++	oldSetting := setting.Webhook.RetryPackageDeliveries
++	setting.Webhook.RetryPackageDeliveries = true
++	t.Cleanup(func() { setting.Webhook.RetryPackageDeliveries = oldSetting })
++
++	var received atomic.Int64
++	var healthy atomic.Bool
++	requests := make(chan time.Time, 12)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		received.Add(1)
++		requests <- time.Now()
++		if !healthy.Load() {
++			w.WriteHeader(http.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(http.StatusOK)
++	}))
++	t.Cleanup(server.Close)
++	ctx := t.Context()
++	hook := &webhook_model.Webhook{
++		RepoID: 3, URL: server.URL, ContentType: webhook_model.ContentTypeJSON,
++		IsActive: true, Type: webhook_module.GITEA,
++	}
++	require.NoError(t, webhook_model.CreateWebhook(ctx, hook))
++
++	publish := func() *webhook_model.HookTask {
++		task, err := webhook_model.CreateHookTask(ctx, &webhook_model.HookTask{
++			HookID: hook.ID, EventType: webhook_module.HookEventPackage,
++			PayloadVersion: 1, PayloadContent: "{}",
++		})
++		require.NoError(t, err)
++		require.Empty(t, handler(task.ID))
++		return task
++	}
++	makeDue := func(id int64, ago time.Duration) *webhook_model.HookTask {
++		task, err := webhook_model.GetHookTaskByID(ctx, id)
++		require.NoError(t, err)
++		task.Delivered = timeutil.TimeStampNano(time.Now().Add(-ago).UnixNano())
++		require.NoError(t, webhook_model.UpdateHookTask(ctx, task))
++		return task
++	}
++
++	first, second := publish(), publish()
++	require.EqualValues(t, 2, received.Load())
++	retryNextPackageWebhook(ctx)
++	require.EqualValues(t, 2, received.Load(), "fresh failures are still cooling down")
++
++	stale := makeDue(first.ID, 3*packageRetryBackoff)
++	makeDue(second.ID, 2*packageRetryBackoff)
++	for _, cleanup := range []webhook_model.HookTaskCleanupType{webhook_model.OlderThan, webhook_model.PerWebhook} {
++		require.NoError(t, webhook_model.CleanupHookTaskTable(ctx, cleanup, 0, 0))
++	}
++
++	retryNextPackageWebhook(ctx)
++	require.EqualValues(t, 3, received.Load(), "only one due task runs per interval")
++	require.NoError(t, deliver(ctx, stale, true))
++	require.EqualValues(t, 3, received.Load(), "a stale claim cannot send another request")
++
++	healthy.Store(true)
++	retryNextPackageWebhook(ctx)
++	retryNextPackageWebhook(ctx)
++	require.EqualValues(t, 4, received.Load(), "a successful delivery stops and the earlier failure cools down again")
++	acknowledged, err := webhook_model.GetHookTaskByID(ctx, second.ID)
++	require.NoError(t, err)
++	require.True(t, acknowledged.IsSucceed)
++
++	makeDue(first.ID, 2*packageRetryBackoff)
++	retryNextPackageWebhook(ctx)
++	require.EqualValues(t, 5, received.Load(), "the retained earlier delivery recovers")
++
++	healthy.Store(false)
++	for _, age := range []time.Duration{3 * packageRetryBackoff, 2 * packageRetryBackoff} {
++		retained := makeDue(publish().ID, age)
++		retained.IsDelivered = false // The old requeue path cleared this flag.
++		require.NoError(t, webhook_model.UpdateHookTask(ctx, retained))
++	}
++	for range 7 {
++		<-requests
++	}
++	retryCtx, cancel := context.WithCancel(ctx)
++	t.Cleanup(cancel)
++	fullQueue, err := queue.NewWorkerPoolQueueWithContext(retryCtx, "webhook-recovery-test",
++		setting.QueueSettings{Type: "channel", Length: 1, BatchLength: 1, MaxWorkers: 1}, handler, true)
++	require.NoError(t, err)
++	require.NoError(t, fullQueue.Push(int64(-1)))
++	populationStarted := make(chan struct{}, 1)
++	enqueue := func(id int64) error {
++		select {
++		case populationStarted <- struct{}{}:
++		default:
++		}
++		return fullQueue.Push(id)
++	}
++	done := make(chan struct{})
++	const spacing = 25 * time.Millisecond
++	go func() {
++		defer close(done)
++		recoverWebhookDeliveries(retryCtx, enqueue, true, spacing)
++	}()
++	defer func() {
++		cancel()
++		<-done
++	}()
++	select {
++	case <-populationStarted:
++	case <-time.After(time.Second):
++		t.Fatal("timed out waiting for the full generic queue to block recovery")
++	}
++	var previous time.Time
++	for range 2 {
++		select {
++		case attempt := <-requests:
++			if !previous.IsZero() {
++				require.GreaterOrEqual(t, attempt.Sub(previous), spacing)
++			}
++			previous = attempt
++		case <-time.After(time.Second):
++			t.Fatal("timed out waiting for a paced retry")
++		}
++	}
++}
++
+diff --git a/services/webhook/webhook.go b/services/webhook/webhook.go
+index 0a53f28..e1d2682 100644
+--- a/services/webhook/webhook.go
++++ b/services/webhook/webhook.go
+@@ -80 +80 @@ func handler(items ...int64) []int64 {
+-
++	var unhandled []int64
+@@ -87,0 +88 @@ func handler(items ...int64) []int64 {
++				unhandled = append(unhandled, taskID)
+@@ -96,0 +98,3 @@ func handler(items ...int64) []int64 {
++		if setting.Webhook.RetryPackageDeliveries && task.EventType == webhook_module.HookEventPackage && task.RequestContent != "" {
++			continue
++		}
+@@ -103 +107 @@ func handler(items ...int64) []int64 {
+-	return nil
++	return unhandled
